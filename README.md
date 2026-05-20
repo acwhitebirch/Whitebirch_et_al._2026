@@ -4,10 +4,10 @@ All code was written in Jupyter Lab by A. C. Whitebirch, Ferguson Laboratory, Un
 
 Key sources and references include:
 
-    Dr. Adam Gordon-Fennell (tidy_lab_tools) for some initial functions and guidance regarding raw photometry data extraction.
-    Pre-processing logic inspired by Simpson et al., Neuron 2024, fiber photometry primer.
-    Self-adminisration analysis code was adapted from a version originally written by Dr. Aaron Garcia, Ferguson Laboratory, University of Washington
-    Baseline correction using adaptive iteratively reweighted penalized least squares (airPLS) adapted from Yizeng Liang and Zhang Zhimin
+  Dr. Adam Gordon-Fennell (tidy_lab_tools) for some initial functions and guidance regarding raw photometry data extraction.
+  Pre-processing logic inspired by Simpson et al., Neuron 2024, fiber photometry primer.
+  Self-adminisration analysis code was adapted from a version originally written by Dr. Aaron Garcia, Ferguson Laboratory, University of Washington
+  Baseline correction using adaptive iteratively reweighted penalized least squares (airPLS) adapted from Yizeng Liang and Zhang Zhimin
 
 Files:
 
