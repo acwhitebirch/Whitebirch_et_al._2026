@@ -4240,7 +4240,7 @@ def detect_peaks(
 
             segment = x[seg_start_idx:seg_end_idx]
             if len(segment) != n_samples:
-                continue
+                continue 
 
             series = pd.Series(segment, name=f"peak_{peak_time:.3f}s")
             peak_segments_raw = pd.concat(
@@ -4334,7 +4334,7 @@ def detect_peaks(
         aucs = np.array([])
 
     # ==========================================================
-    # OPTIONAL PLOTTING (unchanged)
+    # OPTIONAL PLOTTING
     # ==========================================================
     
     def _plot(ts, x, mph, mpd, threshold, prominence, valley, ax, ind, title, tzoom=None, properties=None):
@@ -4497,6 +4497,452 @@ def detect_peaks(
         peak_segments_raw,
         peak_segments_baselined
     )
+
+
+
+
+
+
+
+
+# extract stream data flanking each epoc event, average and plot ---------------------------------------------------------------------
+
+# added the 'event' input
+# updated 04.29.25 to adjust a few things
+
+    # Issue	Fix
+    # Wrong use of abs() in epoch range	Replace with proper signed math
+    # NaN check drops columns redundantly	Move dropna() out of the loop
+    # Stats computed before NaN drop	Move after drop or use skipna
+    # Out-of-bounds indexing not checked	Add guard for start, end
+    # Legend handling hardcoded	Use label= and ax.legend()
+
+    # this allows a subset of events to be examined
+
+# 06.24.25:  modification to measure mean fluorescence and AUC aligned to events of interest
+# 08.14.25: modified to include a baseline subtraction step to better align perievent traces, and to add approach window
+# 11.13.25: updated to include two AUC windows
+# 11.14.25: includes events that fall beyond bounds instead of discarding, pads with NaNs 
+# 01.31.26: updated to loop over data and event types, and include randoms
+# 08.21.26: deleted associated random event and circular shift functions, as I didn't end up using them
+
+
+def epoc_streams(
+    epoc_ts_and_indices,
+    trange,  # e.g. [-10, 25] is a start of 10 seconds prior to event and 25 sec duration
+    stream,
+    new_fs,
+    ts,
+    event,
+    tzoom,
+    cue_duration,
+    subset=None,
+    cue_window=(0, 4),
+    auc_pre_window=(-3, 0),
+    auc_post_window=(0, 4),
+    approach_window=None,
+    plot_auc_region=False,
+    baseline_trange=None,
+    subset_plots = None,
+    pre_buffer_sec = None,
+    label=None,
+    ):
+
+    # Initialize DataFrame to store concatenated epochs
+    GCaMP_465_epocs = pd.DataFrame()
+
+    # Filter the relevant epoc indices
+    event_indices = epoc_ts_and_indices['epoc_indices'][epoc_ts_and_indices['event'] == event]
+
+    # Apply subset restriction if specified
+    if subset is not None:
+        if isinstance(subset, int):
+            event_indices = event_indices.iloc[:subset]
+        elif isinstance(subset, str) and subset.startswith("last"):
+            num = int(subset.replace("last", ""))
+            event_indices = event_indices.iloc[-num:]
+        elif isinstance(subset, (tuple, list)) and len(subset) == 2:
+            event_indices = event_indices.iloc[subset[0]:subset[1]]
+        else:
+            raise ValueError("Invalid subset format.")
+
+    # ----------------------------------------------------------
+    # ✅ Minimal Change #1: Pad out-of-bounds epochs with NaNs
+    # ----------------------------------------------------------
+    win_len = int(trange[1] * new_fs)
+
+    for onset in event_indices:
+        start = int(onset + trange[0] * new_fs)
+        end   = start + win_len
+
+        epoch = np.full(win_len, np.nan)
+
+        valid_start = max(start, 0)
+        valid_end   = min(end, len(stream))
+
+        epoch_start_idx = valid_start - start
+        epoch_end_idx   = epoch_start_idx + (valid_end - valid_start)
+
+        epoch[epoch_start_idx:epoch_end_idx] = stream[valid_start:valid_end]
+
+        epoch_series = pd.Series(epoch, name=f'onset_{(onset / new_fs - pre_buffer_sec):.3f}s')
+        GCaMP_465_epocs = pd.concat([GCaMP_465_epocs,
+                                     epoch_series.reset_index(drop=True)], axis=1)
+
+    print("Number of events found:", len(event_indices))
+
+    if GCaMP_465_epocs.empty:
+        print("No valid epochs found. Skipping stats and plotting.")
+        return (
+            GCaMP_465_epocs,          # epochs
+            None,                     # baselined epochs
+            pd.DataFrame(),           # mean/std/sem df
+            np.array([]),             # mean trace
+            np.array([]),             # std trace
+            np.array([]),             # sem trace
+            None,                     # fig_5
+            None,                     # fig_15
+            (np.nan, np.nan),         # cue stats
+            (np.nan, np.nan),         # auc pre
+            (np.nan, np.nan),         # auc post
+            (np.nan, np.nan),         # approach
+            None                      # subset_figs  ✅ REQUIRED
+        )
+
+
+    if GCaMP_465_epocs.shape[1] <= 2:
+        print(f"Warning: Only {GCaMP_465_epocs.shape[1]} valid epoch(s). Plotting will proceed.")
+
+    # Detect & drop all-NaN columns (bad events)
+    if GCaMP_465_epocs.isna().any().any():
+        na_cols = GCaMP_465_epocs.columns[GCaMP_465_epocs.isna().all()]
+        if len(na_cols) > 0:
+            print("Dropping all-NaN event columns:", na_cols.tolist())
+        GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=na_cols)
+
+    # Keep all rows (you asked for padding rather than row dropping)
+    # ------------------------------------------------------
+
+    # ------------------------------------------------------
+    # Baseline subtraction WITH valid baseline requirement
+    # ------------------------------------------------------
+    if baseline_trange is not None:
+        baseline_start_time = baseline_trange[0]
+        baseline_end_time   = baseline_trange[1]
+
+        baseline_start_idx = int((baseline_start_time - trange[0]) * new_fs)
+        baseline_end_idx   = int((baseline_end_time   - trange[0]) * new_fs)
+
+        if baseline_start_idx < 0 or baseline_end_idx > GCaMP_465_epocs.shape[0]:
+            raise ValueError("Baseline range is out of bounds relative to extracted segments.")
+
+        baseline_slice = GCaMP_465_epocs.iloc[baseline_start_idx:baseline_end_idx]
+
+        # --- NEW: require ≥10% non-NaN per event ---
+        valid_fraction = baseline_slice.notna().sum(axis=0) / len(baseline_slice)
+
+        # columns failing validation:
+        bad_cols = valid_fraction[valid_fraction < 0.1].index.tolist()
+        if len(bad_cols) > 0:
+            print(f"Dropping {len(bad_cols)} events: insufficient baseline samples (<10%).")
+            GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=bad_cols)
+            baseline_slice   = baseline_slice.drop(columns=bad_cols)
+
+        # Now safe to compute baseline means
+        baselines = baseline_slice.mean()
+        GCaMP_465_epocs_baselined = GCaMP_465_epocs.subtract(baselines, axis=1)
+
+    else:
+        print("no baseline correction requested")
+        GCaMP_465_epocs_baselined = None
+
+    
+    data_to_use = GCaMP_465_epocs_baselined if GCaMP_465_epocs_baselined is not None else GCaMP_465_epocs
+
+    mean_epoc_stream = np.nanmean(data_to_use, axis=1)
+   
+    num_epochs = data_to_use.shape[1]
+
+    if num_epochs >= 2:
+        std_epoc_stream  = np.nanstd(data_to_use, axis=1, ddof=1)
+        sem_epoc_stream  = stats.sem(data_to_use, axis=1, nan_policy="omit")
+    else:
+        std_epoc_stream = np.full(data_to_use.shape[0], np.nan)
+        sem_epoc_stream = np.full(data_to_use.shape[0], np.nan)
+        print("⚠ Only one valid epoch left — STD and SEM cannot be computed.")
+    
+
+    ticks = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == event]
+    drugavail = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == 'drug available onset']
+
+    fig_15, ax1 = plt.subplots(1, 1, figsize=(10, 7))
+    ax1.plot(ts, stream, color=[0.1,0.7,0.2])
+    ax1.set_xlim(tzoom)
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Signal')
+    ax1.plot(ticks, np.full_like(ticks, 1.5*np.max(stream)), '|', label='event', color='w')
+    ax1.plot(drugavail, np.full_like(drugavail, 1.55*np.max(stream)), '|', label='drug available onset', color='g')
+    ax1.legend(loc='upper right')
+    if label is not None:
+        ax1.set_title(label)
+
+    
+    # --- plot event ticks ---
+    # Plot event ticks for chosen event
+    for t in ticks:
+        if tzoom[0] <= t <= tzoom[1]:
+            ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='k', zorder=10)
+
+    # Plot drug availability ticks
+    for t in drugavail:
+        if tzoom[0] <= t <= tzoom[1]:
+            ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='c', zorder=10)
+    
+    epoc_ts = trange[0] + np.arange(0, len(mean_epoc_stream)) / new_fs
+        
+    fig_5, ax2 = plt.subplots(1, 1, figsize=(10, 7))
+    if label is not None:
+        ax2.set_title(f"{label}\nPeri-event aligned traces", fontsize=12)
+
+    
+
+    # ------------------------------
+    # Grey single-event traces
+    # ------------------------------
+    ax2.plot(epoc_ts, data_to_use, color=(0.4, 0.4, 0.4), linewidth=0.5, zorder=1)
+
+    ax2.axhline(0, color='white', linestyle=':', linewidth=1)
+    ax2.plot([0, 0],
+             [np.nanmin(data_to_use.values), np.nanmax(data_to_use.values)],
+             'r', linewidth=3)
+
+    # ------------------------------
+    # Mean + SEM
+    # ------------------------------
+    ax2.fill_between(epoc_ts,
+                     mean_epoc_stream + sem_epoc_stream,
+                     mean_epoc_stream - sem_epoc_stream,
+                     facecolor=[1, 1, 0], alpha=0.4, zorder=11)
+    ax2.plot(epoc_ts, mean_epoc_stream, color=[1, 1, 0], linewidth=3, zorder=12)
+
+    # Tight y-axis based on mean ± SEM
+    # Compute ymin and ymax safely
+    if data_to_use.shape[1] == 0:
+        # No valid epochs
+        print("⚠ No valid epochs. Using default y-limits [0, 1].")
+        ymin, ymax = 0, 1
+    elif data_to_use.shape[1] == 1:
+        # Only one valid epoch
+        print("⚠ Only one valid epoch. Using min/max of that epoch for y-limits.")
+        epoch_vals = data_to_use.iloc[:, 0].values
+        epoch_vals = epoch_vals[np.isfinite(epoch_vals)]  # drop NaNs
+        if len(epoch_vals) == 0:
+            ymin, ymax = 0, 1
+        else:
+            ymin, ymax = np.min(epoch_vals), np.max(epoch_vals)
+    else:
+        # Two or more epochs: mean ± SEM
+        ymin = np.nanmin(mean_epoc_stream - sem_epoc_stream)
+        ymax = np.nanmax(mean_epoc_stream + sem_epoc_stream)
+
+    # Fallback in case still NaN
+    if not np.isfinite(ymin) or not np.isfinite(ymax):
+        ymin, ymax = 0, 1
+
+    # Set axis with padding
+    ax2.set_ylim(ymin - 0.5*(ymax - ymin), ymax + 0.5*(ymax - ymin))
+
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Signal')
+
+    # ------------------------------
+    # Data-relative bars based on mean trace
+    # ------------------------------
+    mean_max = np.nanmax(mean_epoc_stream)
+    bar_bottom = ymax * 1.5
+    bar_top    = ymax * 1.6
+    label_y    = bar_top + 0.02 #* mean_max
+
+    # Cue bar
+    ax2.fill_between([0, cue_duration], bar_bottom, bar_top, color='yellow', alpha=0.3)
+    ax2.text(0.05, label_y, 'cue light', color='yellow', va='bottom')
+
+    # Approach bar
+    if approach_window is not None:
+        ax2.fill_between([approach_window[0], approach_window[1]], bar_bottom, bar_top,
+                         color='magenta', alpha=0.3)
+        ax2.text(approach_window[0], label_y, 'approach', color='magenta', va='bottom')
+
+    
+    pre_start_idx = np.searchsorted(epoc_ts, auc_pre_window[0])
+    pre_end_idx   = np.searchsorted(epoc_ts, auc_pre_window[1])
+    post_start_idx = np.searchsorted(epoc_ts, auc_post_window[0])
+    post_end_idx   = np.searchsorted(epoc_ts, auc_post_window[1])
+    
+    # ------------------------------
+    # AUC shading ON TOP of mean trace
+    # ------------------------------
+    if plot_auc_region:
+        # PRE
+        ax2.fill_between(epoc_ts[pre_start_idx:pre_end_idx],
+                         mean_epoc_stream[pre_start_idx:pre_end_idx],
+                         0,
+                         color='green', alpha=0.5,
+                         label='Pre-event AUC', zorder=13)
+        # POST
+        ax2.fill_between(epoc_ts[post_start_idx:post_end_idx],
+                         mean_epoc_stream[post_start_idx:post_end_idx],
+                         0,
+                         color='blue', alpha=0.5,
+                         label='Post-event AUC', zorder=13)
+
+        ax2.legend(loc='upper right')
+
+
+    # ------------------------------
+    # Optional subset plots (still data-relative)
+    # ------------------------------
+    subset_figs = None
+    if subset_plots is not None:
+        subset_figs = []
+        data_to_use_for_subset = data_to_use.copy()
+        epoc_ts_subset = epoc_ts
+
+        gradient_colors = [[1,0,0],[0,1,0], [0,0,1]]
+
+        for i, (start_idx, end_idx) in enumerate(subset_plots):
+            if start_idx < 0 or end_idx > data_to_use_for_subset.shape[1]:
+                print(f"⚠ Subset {i} out of bounds. Skipping.")
+                continue
+
+            subset_data = data_to_use_for_subset.iloc[:, start_idx:end_idx]
+            num_events = subset_data.shape[1]
+
+            cmap = LinearSegmentedColormap.from_list(f'subset_gradient_{i}', gradient_colors, N=num_events)
+            colors = [cmap(j/(num_events-1)) for j in range(num_events)] if num_events > 1 else [to_rgb(gradient_colors[0])]
+
+            fig_subset, ax_subset = plt.subplots(figsize=(10, 6))
+            for j, col in enumerate(subset_data.columns):
+                ax_subset.plot(epoc_ts_subset, subset_data[col], color=colors[j], linewidth=1.5, zorder=j+1)
+
+            ax_subset.axhline(0, color='white', linestyle=':', linewidth=1)
+            ax_subset.plot([0, 0],
+                           [np.nanmin(subset_data.values), np.nanmax(subset_data.values)],
+                           'r', linewidth=2)
+            ax_subset.set_title(f"{label}\nSubset event traces {start_idx}–{end_idx}")
+
+
+            # Bars relative to raw data
+            subset_max = np.nanmax(subset_data.values)
+            bar_bottom = subset_max * 2
+            bar_top = subset_max * 2.2
+            label_y = bar_top + 0.03 * subset_max
+
+            # Cue bar
+            ax_subset.fill_between([0, cue_duration], bar_bottom, bar_top, color='yellow', alpha=0.3)
+            ax_subset.text(0.05, label_y, 'cue light', color='yellow', va='bottom')
+
+            # Approach bar
+            if approach_window is not None:
+                ax_subset.fill_between([approach_window[0], approach_window[1]], bar_bottom, bar_top,
+                                       color='magenta', alpha=0.3)
+                ax_subset.text(-3, label_y, 'approach', color='magenta', va='bottom')
+
+            ax_subset.set_title(f'Subset event traces {start_idx} to {end_idx}')
+            ax_subset.set_xlabel('Time (s)')
+            ax_subset.set_ylabel('Signal')
+            plt.tight_layout()
+
+            subset_figs.append(fig_subset)
+    
+    # ----------------------------------------------------------
+    # Stats
+    # ----------------------------------------------------------
+    GCaMP_465_epocs_mean_std_sem = pd.DataFrame({
+        'mean_epoc_stream': mean_epoc_stream,
+        'std_epoc_stream':  std_epoc_stream,
+        'sem_epoc_stream':  sem_epoc_stream
+    })
+
+    # Cue window stats
+    cue_start_idx = np.searchsorted(epoc_ts, cue_window[0])
+    cue_end_idx   = np.searchsorted(epoc_ts, cue_window[1])
+    cue_vals = data_to_use.iloc[cue_start_idx:cue_end_idx]
+    cue_window_mean = np.nanmean(cue_vals.values)
+    cue_means_per_event = np.nanmean(cue_vals, axis=0)
+    if len(cue_means_per_event) >= 2:
+        cue_window_sem = stats.sem(cue_means_per_event, nan_policy="omit")
+    else:
+        cue_window_sem = np.nan
+
+    # Pre-event AUC
+    pre_vals = []
+    for col in data_to_use.columns:
+        trace = data_to_use[col].iloc[pre_start_idx:pre_end_idx]
+        ts_seg = epoc_ts[pre_start_idx:pre_end_idx]
+        pre_vals.append(np.trapz(trace, ts_seg))
+
+    auc_pre_values = np.array(pre_vals)
+    auc_pre_mean = np.nanmean(auc_pre_values)
+    if len(auc_pre_values) >= 2:
+        auc_pre_sem = stats.sem(auc_pre_values, nan_policy='omit')
+    else:
+        auc_pre_sem = np.nan
+
+    # Post-event AUC
+    post_vals = []
+    for col in data_to_use.columns:
+        trace = data_to_use[col].iloc[post_start_idx:post_end_idx]
+        ts_seg = epoc_ts[post_start_idx:post_end_idx]
+        post_vals.append(np.trapz(trace, ts_seg))
+
+    auc_post_values = np.array(post_vals)
+    auc_post_mean = np.nanmean(auc_post_values)
+    if len(auc_post_values) >= 2:
+        auc_post_sem = stats.sem(auc_post_values, nan_policy='omit')
+    else:
+        auc_post_sem = np.nan
+
+    # Approach window stats
+    if approach_window is not None:
+        a_start = np.searchsorted(epoc_ts, approach_window[0])
+        a_end   = np.searchsorted(epoc_ts, approach_window[1])
+        a_vals = data_to_use.iloc[a_start:a_end]
+        approach_window_mean = np.nanmean(a_vals.values)
+        approach_means = np.nanmean(a_vals, axis=0)
+
+        if len(approach_means) >= 2:
+            approach_window_sem = stats.sem(approach_means, nan_policy='omit')
+        else:
+            approach_window_sem = np.nan
+            
+    else:
+        approach_window_mean = np.nan
+        approach_window_sem  = np.nan
+
+    return (
+        GCaMP_465_epocs,
+        GCaMP_465_epocs_baselined,
+        GCaMP_465_epocs_mean_std_sem,
+        mean_epoc_stream,
+        std_epoc_stream,
+        sem_epoc_stream,
+        fig_5,
+        fig_15,
+        (cue_window_mean, cue_window_sem),
+        (auc_pre_mean, auc_pre_sem),
+        (auc_post_mean, auc_post_sem),
+        (approach_window_mean, approach_window_sem),
+        subset_figs, 
+    )
+
+
+
+
+
+
+
+
 
 
 
@@ -6499,1324 +6945,6 @@ def plot_streams_preproc(streams_df, ts, tzoom, padding=0.2):
 
        
 
-
-# extract stream data flanking each epoc event, average and plot ---------------------------------------------------------------------
-
-# added the 'event' input
-# updated 04.29.25 to adjust a few things
-
-    # Issue	Fix
-    # Wrong use of abs() in epoch range	Replace with proper signed math
-    # NaN check drops columns redundantly	Move dropna() out of the loop
-    # Stats computed before NaN drop	Move after drop or use skipna
-    # Out-of-bounds indexing not checked	Add guard for start, end
-    # Legend handling hardcoded	Use label= and ax.legend()
-
-    # this allows a subset of events to be examined
-
-# 06.24.25:  modification to measure mean fluorescence and AUC aligned to events of interest
-# 08.14.25: modified to include a baseline subtraction step to better align perievent traces, and to add approach window
-# 11.13.25: updated to include two AUC windows
-# 11.14.25: inclues events that fall beyond bounds instead of discarding, pads with NaNs 
-# 01.31.26: updated to loop over data and event types, and include randoms
-
-
-def make_circular_shift_null(epocs_baselined, n_boot=1000, min_shift=10):
-    """
-    epocs_baselined: (time × events)
-    Returns: DataFrame (time × n_boot)
-    """
-    n_time, n_events = epocs_baselined.shape
-    null_means = []
-
-    for _ in range(n_boot):
-        shifts = np.random.randint(min_shift, n_time - min_shift, size=n_events)
-        shifted = np.column_stack([
-            np.roll(epocs_baselined.iloc[:, i].values, shifts[i])
-            for i in range(n_events)
-        ])
-        null_means.append(np.nanmean(shifted, axis=1))
-
-    return pd.DataFrame(np.column_stack(null_means),
-                        index=epocs_baselined.index)
-
-
-def generate_random_event_indices(
-    ts,
-    new_fs,
-    n_events,
-    pre_buffer_sec=0,
-    trange=(-10, 25),
-    real_event_indices=None,
-    min_spacing_sec=5,
-    random_state=None
-):
-    """
-    Generate random epoc indices suitable as peri-event controls.
-
-    - Avoids real events
-    - Enforces minimum spacing
-    - Respects peri-event window bounds
-    """
-
-    rng = np.random.default_rng(random_state)
-
-    buffer = int((abs(trange[0]) + trange[1]) * new_fs)
-    valid_start = int(pre_buffer_sec * new_fs) + buffer
-    valid_end   = len(ts) - buffer
-
-    if valid_end <= valid_start:
-        raise ValueError("Recording too short for random event generation.")
-
-    candidate_indices = np.arange(valid_start, valid_end)
-
-    # Remove indices near real events
-    if real_event_indices is not None:
-        exclusion_radius = int(min_spacing_sec * new_fs)
-        mask = np.ones_like(candidate_indices, dtype=bool)
-
-        for idx in real_event_indices:
-            mask &= np.abs(candidate_indices - idx) > exclusion_radius
-
-        candidate_indices = candidate_indices[mask]
-
-    if len(candidate_indices) < n_events:
-        raise ValueError("Not enough valid indices after exclusions.")
-
-    # Enforce spacing between random events
-    selected = []
-    while len(selected) < n_events:
-        candidate = rng.choice(candidate_indices)
-        if all(abs(candidate - s) >= min_spacing_sec * new_fs for s in selected):
-            selected.append(candidate)
-
-    return pd.Series(np.sort(selected))
-
-
-def epoc_streams(
-    epoc_ts_and_indices,
-    trange,
-    stream,
-    new_fs,
-    ts,
-    event,
-    tzoom,
-    cue_duration,
-    subset=None,
-    cue_window=(0, 4),
-    auc_pre_window=(-3, 0),
-    auc_post_window=(0, 4),
-    approach_window=None,
-    plot_auc_region=False,
-    baseline_trange=None,
-    subset_plots = None,
-    pre_buffer_sec = None,
-    label=None,
-    ):
-
-    # Initialize DataFrame to store concatenated epochs
-    GCaMP_465_epocs = pd.DataFrame()
-
-    # Filter the relevant epoc indices
-    event_indices = epoc_ts_and_indices['epoc_indices'][epoc_ts_and_indices['event'] == event]
-
-    # Apply subset restriction if specified
-    if subset is not None:
-        if isinstance(subset, int):
-            event_indices = event_indices.iloc[:subset]
-        elif isinstance(subset, str) and subset.startswith("last"):
-            num = int(subset.replace("last", ""))
-            event_indices = event_indices.iloc[-num:]
-        elif isinstance(subset, (tuple, list)) and len(subset) == 2:
-            event_indices = event_indices.iloc[subset[0]:subset[1]]
-        else:
-            raise ValueError("Invalid subset format.")
-
-    # ----------------------------------------------------------
-    # ✅ Minimal Change #1: Pad out-of-bounds epochs with NaNs
-    # ----------------------------------------------------------
-    win_len = int(trange[1] * new_fs)
-
-    for onset in event_indices:
-        start = int(onset + trange[0] * new_fs)
-        end   = start + win_len
-
-        epoch = np.full(win_len, np.nan)
-
-        valid_start = max(start, 0)
-        valid_end   = min(end, len(stream))
-
-        epoch_start_idx = valid_start - start
-        epoch_end_idx   = epoch_start_idx + (valid_end - valid_start)
-
-        epoch[epoch_start_idx:epoch_end_idx] = stream[valid_start:valid_end]
-
-        epoch_series = pd.Series(epoch, name=f'onset_{(onset / new_fs - pre_buffer_sec):.3f}s')
-        GCaMP_465_epocs = pd.concat([GCaMP_465_epocs,
-                                     epoch_series.reset_index(drop=True)], axis=1)
-
-    print("Number of events found:", len(event_indices))
-
-    if GCaMP_465_epocs.empty:
-        print("No valid epochs found. Skipping stats and plotting.")
-        return (
-            GCaMP_465_epocs,          # epochs
-            None,                     # baselined epochs
-            pd.DataFrame(),           # mean/std/sem df
-            np.array([]),             # mean trace
-            np.array([]),             # std trace
-            np.array([]),             # sem trace
-            None,                     # fig_5
-            None,                     # fig_15
-            (np.nan, np.nan),         # cue stats
-            (np.nan, np.nan),         # auc pre
-            (np.nan, np.nan),         # auc post
-            (np.nan, np.nan),         # approach
-            None                      # subset_figs  ✅ REQUIRED
-        )
-
-
-    if GCaMP_465_epocs.shape[1] <= 2:
-        print(f"Warning: Only {GCaMP_465_epocs.shape[1]} valid epoch(s). Plotting will proceed.")
-
-    # Detect & drop all-NaN columns (bad events)
-    if GCaMP_465_epocs.isna().any().any():
-        na_cols = GCaMP_465_epocs.columns[GCaMP_465_epocs.isna().all()]
-        if len(na_cols) > 0:
-            print("Dropping all-NaN event columns:", na_cols.tolist())
-        GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=na_cols)
-
-    # Keep all rows (you asked for padding rather than row dropping)
-    # ------------------------------------------------------
-
-    # ------------------------------------------------------
-    # Baseline subtraction WITH valid baseline requirement
-    # ------------------------------------------------------
-    if baseline_trange is not None:
-        baseline_start_time = baseline_trange[0]
-        baseline_end_time   = baseline_trange[1]
-
-        baseline_start_idx = int((baseline_start_time - trange[0]) * new_fs)
-        baseline_end_idx   = int((baseline_end_time   - trange[0]) * new_fs)
-
-        if baseline_start_idx < 0 or baseline_end_idx > GCaMP_465_epocs.shape[0]:
-            raise ValueError("Baseline range is out of bounds relative to extracted segments.")
-
-        baseline_slice = GCaMP_465_epocs.iloc[baseline_start_idx:baseline_end_idx]
-
-        # --- NEW: require ≥50% non-NaN per event ---
-        valid_fraction = baseline_slice.notna().sum(axis=0) / len(baseline_slice)
-
-        # columns failing validation:
-        bad_cols = valid_fraction[valid_fraction < 0.1].index.tolist()
-        if len(bad_cols) > 0:
-            print(f"Dropping {len(bad_cols)} events: insufficient baseline samples (<10%).")
-            GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=bad_cols)
-            baseline_slice   = baseline_slice.drop(columns=bad_cols)
-
-        # Now safe to compute baseline means
-        baselines = baseline_slice.mean()
-        GCaMP_465_epocs_baselined = GCaMP_465_epocs.subtract(baselines, axis=1)
-
-    else:
-        print("no baseline correction requested")
-        GCaMP_465_epocs_baselined = None
-
-    
-    data_to_use = GCaMP_465_epocs_baselined if GCaMP_465_epocs_baselined is not None else GCaMP_465_epocs
-
-    mean_epoc_stream = np.nanmean(data_to_use, axis=1)
-   
-    num_epochs = data_to_use.shape[1]
-
-    if num_epochs >= 2:
-        std_epoc_stream  = np.nanstd(data_to_use, axis=1, ddof=1)
-        sem_epoc_stream  = stats.sem(data_to_use, axis=1, nan_policy="omit")
-    else:
-        std_epoc_stream = np.full(data_to_use.shape[0], np.nan)
-        sem_epoc_stream = np.full(data_to_use.shape[0], np.nan)
-        print("⚠ Only one valid epoch left — STD and SEM cannot be computed.")
-    
-
-    ticks = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == event]
-    drugavail = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == 'drug available onset']
-
-    fig_15, ax1 = plt.subplots(1, 1, figsize=(10, 7))
-    ax1.plot(ts, stream, color=[0.1,0.7,0.2])
-    ax1.set_xlim(tzoom)
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Signal')
-    ax1.plot(ticks, np.full_like(ticks, 1.5*np.max(stream)), '|', label='event', color='w')
-    ax1.plot(drugavail, np.full_like(drugavail, 1.55*np.max(stream)), '|', label='drug available onset', color='g')
-    ax1.legend(loc='upper right')
-    if label is not None:
-        ax1.set_title(label)
-
-    
-    # --- plot event ticks ---
-    # Plot event ticks for chosen event
-    for t in ticks:
-        if tzoom[0] <= t <= tzoom[1]:
-            ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='k', zorder=10)
-
-    # Plot drug availability ticks
-    for t in drugavail:
-        if tzoom[0] <= t <= tzoom[1]:
-            ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='c', zorder=10)
-    
-    epoc_ts = trange[0] + np.arange(0, len(mean_epoc_stream)) / new_fs
-        
-    fig_5, ax2 = plt.subplots(1, 1, figsize=(10, 7))
-    if label is not None:
-        ax2.set_title(f"{label}\nPeri-event aligned traces", fontsize=12)
-
-    
-
-    # ------------------------------
-    # Grey single-event traces
-    # ------------------------------
-    ax2.plot(epoc_ts, data_to_use, color=(0.4, 0.4, 0.4), linewidth=0.5, zorder=1)
-
-    ax2.axhline(0, color='white', linestyle=':', linewidth=1)
-    ax2.plot([0, 0],
-             [np.nanmin(data_to_use.values), np.nanmax(data_to_use.values)],
-             'r', linewidth=3)
-
-    # ------------------------------
-    # Mean + SEM
-    # ------------------------------
-    ax2.fill_between(epoc_ts,
-                     mean_epoc_stream + sem_epoc_stream,
-                     mean_epoc_stream - sem_epoc_stream,
-                     facecolor=[1, 1, 0], alpha=0.4, zorder=11)
-    ax2.plot(epoc_ts, mean_epoc_stream, color=[1, 1, 0], linewidth=3, zorder=12)
-
-    # Tight y-axis based on mean ± SEM
-    # Compute ymin and ymax safely
-    if data_to_use.shape[1] == 0:
-        # No valid epochs
-        print("⚠ No valid epochs. Using default y-limits [0, 1].")
-        ymin, ymax = 0, 1
-    elif data_to_use.shape[1] == 1:
-        # Only one valid epoch
-        print("⚠ Only one valid epoch. Using min/max of that epoch for y-limits.")
-        epoch_vals = data_to_use.iloc[:, 0].values
-        epoch_vals = epoch_vals[np.isfinite(epoch_vals)]  # drop NaNs
-        if len(epoch_vals) == 0:
-            ymin, ymax = 0, 1
-        else:
-            ymin, ymax = np.min(epoch_vals), np.max(epoch_vals)
-    else:
-        # Two or more epochs: mean ± SEM
-        ymin = np.nanmin(mean_epoc_stream - sem_epoc_stream)
-        ymax = np.nanmax(mean_epoc_stream + sem_epoc_stream)
-
-    # Fallback in case still NaN
-    if not np.isfinite(ymin) or not np.isfinite(ymax):
-        ymin, ymax = 0, 1
-
-    # Set axis with padding
-    ax2.set_ylim(ymin - 0.5*(ymax - ymin), ymax + 0.5*(ymax - ymin))
-
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Signal')
-
-    # ------------------------------
-    # Data-relative bars based on mean trace
-    # ------------------------------
-    mean_max = np.nanmax(mean_epoc_stream)
-    bar_bottom = ymax * 1.5
-    bar_top    = ymax * 1.6
-    label_y    = bar_top + 0.02 #* mean_max
-
-    # Cue bar
-    ax2.fill_between([0, cue_duration], bar_bottom, bar_top, color='yellow', alpha=0.3)
-    ax2.text(0.05, label_y, 'cue light', color='yellow', va='bottom')
-
-    # Approach bar
-    if approach_window is not None:
-        ax2.fill_between([approach_window[0], approach_window[1]], bar_bottom, bar_top,
-                         color='magenta', alpha=0.3)
-        ax2.text(approach_window[0], label_y, 'approach', color='magenta', va='bottom')
-
-    # ------------------------------
-    # AUC shading ON TOP of mean trace
-    # ------------------------------
-    if plot_auc_region:
-        # PRE
-        pre_start_idx = np.searchsorted(epoc_ts, auc_pre_window[0])
-        pre_end_idx   = np.searchsorted(epoc_ts, auc_pre_window[1])
-        ax2.fill_between(epoc_ts[pre_start_idx:pre_end_idx],
-                         mean_epoc_stream[pre_start_idx:pre_end_idx],
-                         0,
-                         color='green', alpha=0.5,
-                         label='Pre-event AUC', zorder=13)
-
-        # POST
-        post_start_idx = np.searchsorted(epoc_ts, auc_post_window[0])
-        post_end_idx   = np.searchsorted(epoc_ts, auc_post_window[1])
-        ax2.fill_between(epoc_ts[post_start_idx:post_end_idx],
-                         mean_epoc_stream[post_start_idx:post_end_idx],
-                         0,
-                         color='blue', alpha=0.5,
-                         label='Post-event AUC', zorder=13)
-
-        ax2.legend(loc='upper right')
-
-
-    # ------------------------------
-    # Optional subset plots (still data-relative)
-    # ------------------------------
-    subset_figs = None
-    if subset_plots is not None:
-        subset_figs = []
-        data_to_use_for_subset = data_to_use.copy()
-        epoc_ts_subset = epoc_ts
-
-        gradient_colors = [[1,0,0],[0,1,0], [0,0,1]]
-
-        for i, (start_idx, end_idx) in enumerate(subset_plots):
-            if start_idx < 0 or end_idx > data_to_use_for_subset.shape[1]:
-                print(f"⚠ Subset {i} out of bounds. Skipping.")
-                continue
-
-            subset_data = data_to_use_for_subset.iloc[:, start_idx:end_idx]
-            num_events = subset_data.shape[1]
-
-            cmap = LinearSegmentedColormap.from_list(f'subset_gradient_{i}', gradient_colors, N=num_events)
-            colors = [cmap(j/(num_events-1)) for j in range(num_events)] if num_events > 1 else [to_rgb(gradient_colors[0])]
-
-            fig_subset, ax_subset = plt.subplots(figsize=(10, 6))
-            for j, col in enumerate(subset_data.columns):
-                ax_subset.plot(epoc_ts_subset, subset_data[col], color=colors[j], linewidth=1.5, zorder=j+1)
-
-            ax_subset.axhline(0, color='white', linestyle=':', linewidth=1)
-            ax_subset.plot([0, 0],
-                           [np.nanmin(subset_data.values), np.nanmax(subset_data.values)],
-                           'r', linewidth=2)
-            ax_subset.set_title(f"{label}\nSubset event traces {start_idx}–{end_idx}")
-
-
-            # Bars relative to raw data
-            subset_max = np.nanmax(subset_data.values)
-            bar_bottom = subset_max * 2
-            bar_top = subset_max * 2.2
-            label_y = bar_top + 0.03 * subset_max
-
-            # Cue bar
-            ax_subset.fill_between([0, cue_duration], bar_bottom, bar_top, color='yellow', alpha=0.3)
-            ax_subset.text(0.05, label_y, 'cue light', color='yellow', va='bottom')
-
-            # Approach bar
-            if approach_window is not None:
-                ax_subset.fill_between([approach_window[0], approach_window[1]], bar_bottom, bar_top,
-                                       color='magenta', alpha=0.3)
-                ax_subset.text(-3, label_y, 'approach', color='magenta', va='bottom')
-
-            ax_subset.set_title(f'Subset event traces {start_idx} to {end_idx}')
-            ax_subset.set_xlabel('Time (s)')
-            ax_subset.set_ylabel('Signal')
-            plt.tight_layout()
-
-            subset_figs.append(fig_subset)
-    
-    # ----------------------------------------------------------
-    # Stats
-    # ----------------------------------------------------------
-    GCaMP_465_epocs_mean_std_sem = pd.DataFrame({
-        'mean_epoc_stream': mean_epoc_stream,
-        'std_epoc_stream':  std_epoc_stream,
-        'sem_epoc_stream':  sem_epoc_stream
-    })
-
-    # Cue window stats
-    cue_start_idx = np.searchsorted(epoc_ts, cue_window[0])
-    cue_end_idx   = np.searchsorted(epoc_ts, cue_window[1])
-    cue_vals = data_to_use.iloc[cue_start_idx:cue_end_idx]
-    cue_window_mean = np.nanmean(cue_vals.values)
-    cue_means_per_event = np.nanmean(cue_vals, axis=0)
-    if len(cue_means_per_event) >= 2:
-        cue_window_sem = stats.sem(cue_means_per_event, nan_policy="omit")
-    else:
-        cue_window_sem = np.nan
-
-    # Pre-event AUC
-    pre_vals = []
-    for col in data_to_use.columns:
-        trace = data_to_use[col].iloc[pre_start_idx:pre_end_idx]
-        ts_seg = epoc_ts[pre_start_idx:pre_end_idx]
-        pre_vals.append(np.trapz(trace, ts_seg))
-
-    auc_pre_values = np.array(pre_vals)
-    auc_pre_mean = np.nanmean(auc_pre_values)
-    if len(auc_pre_values) >= 2:
-        auc_pre_sem = stats.sem(auc_pre_values, nan_policy='omit')
-    else:
-        auc_pre_sem = np.nan
-
-    # Post-event AUC
-    post_vals = []
-    for col in data_to_use.columns:
-        trace = data_to_use[col].iloc[post_start_idx:post_end_idx]
-        ts_seg = epoc_ts[post_start_idx:post_end_idx]
-        post_vals.append(np.trapz(trace, ts_seg))
-
-    auc_post_values = np.array(post_vals)
-    auc_post_mean = np.nanmean(auc_post_values)
-    if len(auc_post_values) >= 2:
-        auc_post_sem = stats.sem(auc_post_values, nan_policy='omit')
-    else:
-        auc_post_sem = np.nan
-
-    # Approach window stats
-    if approach_window is not None:
-        a_start = np.searchsorted(epoc_ts, approach_window[0])
-        a_end   = np.searchsorted(epoc_ts, approach_window[1])
-        a_vals = data_to_use.iloc[a_start:a_end]
-        approach_window_mean = np.nanmean(a_vals.values)
-        approach_means = np.nanmean(a_vals, axis=0)
-
-        if len(approach_means) >= 2:
-            approach_window_sem = stats.sem(approach_means, nan_policy='omit')
-        else:
-            approach_window_sem = np.nan
-            
-    else:
-        approach_window_mean = np.nan
-        approach_window_sem  = np.nan
-
-    return (
-        GCaMP_465_epocs,
-        GCaMP_465_epocs_baselined,
-        GCaMP_465_epocs_mean_std_sem,
-        mean_epoc_stream,
-        std_epoc_stream,
-        sem_epoc_stream,
-        fig_5,
-        fig_15,
-        (cue_window_mean, cue_window_sem),
-        (auc_pre_mean, auc_pre_sem),
-        (auc_post_mean, auc_post_sem),
-        (approach_window_mean, approach_window_sem),
-        subset_figs, 
-    )
-
-
-
-
-# extract stream data flanking each epoc event, average and plot ---------------------------------------------------------------------
-
-# added the 'event' input
-# updated 04.29.25 to adjust a few things
-
-    # Issue	Fix
-    # Wrong use of abs() in epoch range	Replace with proper signed math
-    # NaN check drops columns redundantly	Move dropna() out of the loop
-    # Stats computed before NaN drop	Move after drop or use skipna
-    # Out-of-bounds indexing not checked	Add guard for start, end
-    # Legend handling hardcoded	Use label= and ax.legend()
-
-    # this allows a subset of events to be examined
-
-# 06.24.25:  modification to measure mean fluorescence and AUC aligned to events of interest
-# 08.14.25: modified to include a baseline subtraction step to better align perievent traces, and to add approach window
-# 11.13.25: updated to include two AUC windows
-# 11.14.25: inclues events that fall beyond bounds instead of discarding, pads with NaNs 
-
-
-def epoc_streams_013026(
-    epoc_ts_and_indices,
-    trange,
-    stream,
-    new_fs,
-    ts,
-    event,
-    tzoom,
-    cue_duration,
-    subset=None,
-    cue_window=(0, 4),
-    auc_pre_window=(-3, 0),
-    auc_post_window=(0, 4),
-    approach_window=None,
-    plot_auc_region=False,
-    baseline_trange=None,
-    subset_plots = None,
-    pre_buffer_sec = None
-    ):
-
-    # Initialize DataFrame to store concatenated epochs
-    GCaMP_465_epocs = pd.DataFrame()
-
-    # Filter the relevant epoc indices
-    event_indices = epoc_ts_and_indices['epoc_indices'][epoc_ts_and_indices['event'] == event]
-
-    # Apply subset restriction if specified
-    if subset is not None:
-        if isinstance(subset, int):
-            event_indices = event_indices.iloc[:subset]
-        elif isinstance(subset, str) and subset.startswith("last"):
-            num = int(subset.replace("last", ""))
-            event_indices = event_indices.iloc[-num:]
-        elif isinstance(subset, (tuple, list)) and len(subset) == 2:
-            event_indices = event_indices.iloc[subset[0]:subset[1]]
-        else:
-            raise ValueError("Invalid subset format.")
-
-    # ----------------------------------------------------------
-    # ✅ Minimal Change #1: Pad out-of-bounds epochs with NaNs
-    # ----------------------------------------------------------
-    win_len = int(trange[1] * new_fs)
-
-    for onset in event_indices:
-        start = int(onset + trange[0] * new_fs)
-        end   = start + win_len
-
-        epoch = np.full(win_len, np.nan)
-
-        valid_start = max(start, 0)
-        valid_end   = min(end, len(stream))
-
-        epoch_start_idx = valid_start - start
-        epoch_end_idx   = epoch_start_idx + (valid_end - valid_start)
-
-        epoch[epoch_start_idx:epoch_end_idx] = stream[valid_start:valid_end]
-
-        epoch_series = pd.Series(epoch, name=f'onset_{(onset / new_fs - pre_buffer_sec):.3f}s')
-        GCaMP_465_epocs = pd.concat([GCaMP_465_epocs,
-                                     epoch_series.reset_index(drop=True)], axis=1)
-
-    print("Number of events found:", len(event_indices))
-
-    if GCaMP_465_epocs.empty:
-        print("No valid epochs found. Skipping stats and plotting.")
-        return (
-            GCaMP_465_epocs,          # epochs
-            None,                     # baselined epochs
-            pd.DataFrame(),           # mean/std/sem df
-            np.array([]),             # mean trace
-            np.array([]),             # std trace
-            np.array([]),             # sem trace
-            None,                     # fig_5
-            None,                     # fig_15
-            (np.nan, np.nan),         # cue stats
-            (np.nan, np.nan),         # auc pre
-            (np.nan, np.nan),         # auc post
-            (np.nan, np.nan),         # approach
-            None                      # subset_figs  ✅ REQUIRED
-        )
-
-
-    if GCaMP_465_epocs.shape[1] <= 2:
-        print(f"Warning: Only {GCaMP_465_epocs.shape[1]} valid epoch(s). Plotting will proceed.")
-
-    # Detect & drop all-NaN columns (bad events)
-    if GCaMP_465_epocs.isna().any().any():
-        na_cols = GCaMP_465_epocs.columns[GCaMP_465_epocs.isna().all()]
-        if len(na_cols) > 0:
-            print("Dropping all-NaN event columns:", na_cols.tolist())
-        GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=na_cols)
-
-    # Keep all rows (you asked for padding rather than row dropping)
-    # ------------------------------------------------------
-
-    # ------------------------------------------------------
-    # Baseline subtraction WITH valid baseline requirement
-    # ------------------------------------------------------
-    if baseline_trange is not None:
-        baseline_start_time = baseline_trange[0]
-        baseline_end_time   = baseline_trange[1]
-
-        baseline_start_idx = int((baseline_start_time - trange[0]) * new_fs)
-        baseline_end_idx   = int((baseline_end_time   - trange[0]) * new_fs)
-
-        if baseline_start_idx < 0 or baseline_end_idx > GCaMP_465_epocs.shape[0]:
-            raise ValueError("Baseline range is out of bounds relative to extracted segments.")
-
-        baseline_slice = GCaMP_465_epocs.iloc[baseline_start_idx:baseline_end_idx]
-
-        # --- NEW: require ≥50% non-NaN per event ---
-        valid_fraction = baseline_slice.notna().sum(axis=0) / len(baseline_slice)
-
-        # columns failing validation:
-        bad_cols = valid_fraction[valid_fraction < 0.1].index.tolist()
-        if len(bad_cols) > 0:
-            print(f"Dropping {len(bad_cols)} events: insufficient baseline samples (<10%).")
-            GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=bad_cols)
-            baseline_slice   = baseline_slice.drop(columns=bad_cols)
-
-        # Now safe to compute baseline means
-        baselines = baseline_slice.mean()
-        GCaMP_465_epocs_baselined = GCaMP_465_epocs.subtract(baselines, axis=1)
-
-    else:
-        print("no baseline correction requested")
-        GCaMP_465_epocs_baselined = None
-
-    
-    data_to_use = GCaMP_465_epocs_baselined if GCaMP_465_epocs_baselined is not None else GCaMP_465_epocs
-
-    mean_epoc_stream = np.nanmean(data_to_use, axis=1)
-   
-    num_epochs = data_to_use.shape[1]
-
-    if num_epochs >= 2:
-        std_epoc_stream  = np.nanstd(data_to_use, axis=1, ddof=1)
-        sem_epoc_stream  = stats.sem(data_to_use, axis=1, nan_policy="omit")
-    else:
-        std_epoc_stream = np.full(data_to_use.shape[0], np.nan)
-        sem_epoc_stream = np.full(data_to_use.shape[0], np.nan)
-        print("⚠ Only one valid epoch left — STD and SEM cannot be computed.")
-    
-
-    ticks = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == event]
-    drugavail = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == 'drug available onset']
-
-    fig_15, ax1 = plt.subplots(1, 1, figsize=(10, 7))
-    ax1.plot(ts, stream, color=[0.1,0.7,0.2])
-    ax1.set_xlim(tzoom)
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Signal')
-    ax1.plot(ticks, np.full_like(ticks, 1.5*np.max(stream)), '|', label='event', color='w')
-    ax1.plot(drugavail, np.full_like(drugavail, 1.55*np.max(stream)), '|', label='drug available onset', color='g')
-    ax1.legend(loc='upper right')
-    
-    # --- plot event ticks ---
-    # Plot event ticks for chosen event
-    for t in ticks:
-        if tzoom[0] <= t <= tzoom[1]:
-            ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='k', zorder=10)
-
-    # Plot drug availability ticks
-    for t in drugavail:
-        if tzoom[0] <= t <= tzoom[1]:
-            ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='c', zorder=10)
-    
-    epoc_ts = trange[0] + np.arange(0, len(mean_epoc_stream)) / new_fs
-        
-    fig_5, ax2 = plt.subplots(1, 1, figsize=(10, 7))
-    
-
-    # ------------------------------
-    # Grey single-event traces
-    # ------------------------------
-    ax2.plot(epoc_ts, data_to_use, color=(0.4, 0.4, 0.4), linewidth=0.5, zorder=1)
-
-    ax2.axhline(0, color='white', linestyle=':', linewidth=1)
-    ax2.plot([0, 0],
-             [np.nanmin(data_to_use.values), np.nanmax(data_to_use.values)],
-             'r', linewidth=3)
-
-    # ------------------------------
-    # Mean + SEM
-    # ------------------------------
-    ax2.fill_between(epoc_ts,
-                     mean_epoc_stream + sem_epoc_stream,
-                     mean_epoc_stream - sem_epoc_stream,
-                     facecolor=[1, 1, 0], alpha=0.4, zorder=11)
-    ax2.plot(epoc_ts, mean_epoc_stream, color=[1, 1, 0], linewidth=3, zorder=12)
-
-    # Tight y-axis based on mean ± SEM
-    # Compute ymin and ymax safely
-    if data_to_use.shape[1] == 0:
-        # No valid epochs
-        print("⚠ No valid epochs. Using default y-limits [0, 1].")
-        ymin, ymax = 0, 1
-    elif data_to_use.shape[1] == 1:
-        # Only one valid epoch
-        print("⚠ Only one valid epoch. Using min/max of that epoch for y-limits.")
-        epoch_vals = data_to_use.iloc[:, 0].values
-        epoch_vals = epoch_vals[np.isfinite(epoch_vals)]  # drop NaNs
-        if len(epoch_vals) == 0:
-            ymin, ymax = 0, 1
-        else:
-            ymin, ymax = np.min(epoch_vals), np.max(epoch_vals)
-    else:
-        # Two or more epochs: mean ± SEM
-        ymin = np.nanmin(mean_epoc_stream - sem_epoc_stream)
-        ymax = np.nanmax(mean_epoc_stream + sem_epoc_stream)
-
-    # Fallback in case still NaN
-    if not np.isfinite(ymin) or not np.isfinite(ymax):
-        ymin, ymax = 0, 1
-
-    # Set axis with padding
-    ax2.set_ylim(ymin - 0.5*(ymax - ymin), ymax + 0.5*(ymax - ymin))
-
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Signal')
-
-    # ------------------------------
-    # Data-relative bars based on mean trace
-    # ------------------------------
-    mean_max = np.nanmax(mean_epoc_stream)
-    bar_bottom = ymax * 1.5
-    bar_top    = ymax * 1.6
-    label_y    = bar_top + 0.02 #* mean_max
-
-    # Cue bar
-    ax2.fill_between([0, cue_duration], bar_bottom, bar_top, color='yellow', alpha=0.3)
-    ax2.text(0.05, label_y, 'cue light', color='yellow', va='bottom')
-
-    # Approach bar
-    if approach_window is not None:
-        ax2.fill_between([approach_window[0], approach_window[1]], bar_bottom, bar_top,
-                         color='magenta', alpha=0.3)
-        ax2.text(approach_window[0], label_y, 'approach', color='magenta', va='bottom')
-
-    # ------------------------------
-    # AUC shading ON TOP of mean trace
-    # ------------------------------
-    if plot_auc_region:
-        # PRE
-        pre_start_idx = np.searchsorted(epoc_ts, auc_pre_window[0])
-        pre_end_idx   = np.searchsorted(epoc_ts, auc_pre_window[1])
-        ax2.fill_between(epoc_ts[pre_start_idx:pre_end_idx],
-                         mean_epoc_stream[pre_start_idx:pre_end_idx],
-                         0,
-                         color='green', alpha=0.5,
-                         label='Pre-event AUC', zorder=13)
-
-        # POST
-        post_start_idx = np.searchsorted(epoc_ts, auc_post_window[0])
-        post_end_idx   = np.searchsorted(epoc_ts, auc_post_window[1])
-        ax2.fill_between(epoc_ts[post_start_idx:post_end_idx],
-                         mean_epoc_stream[post_start_idx:post_end_idx],
-                         0,
-                         color='blue', alpha=0.5,
-                         label='Post-event AUC', zorder=13)
-
-        ax2.legend(loc='upper right')
-
-    # ------------------------------
-    # Optional subset plots (still data-relative)
-    # ------------------------------
-    subset_figs = None
-    if subset_plots is not None:
-        subset_figs = []
-        data_to_use_for_subset = data_to_use.copy()
-        epoc_ts_subset = epoc_ts
-
-        gradient_colors = [[1,0,0],[0,1,0], [0,0,1]]
-
-        for i, (start_idx, end_idx) in enumerate(subset_plots):
-            if start_idx < 0 or end_idx > data_to_use_for_subset.shape[1]:
-                print(f"⚠ Subset {i} out of bounds. Skipping.")
-                continue
-
-            subset_data = data_to_use_for_subset.iloc[:, start_idx:end_idx]
-            num_events = subset_data.shape[1]
-
-            cmap = LinearSegmentedColormap.from_list(f'subset_gradient_{i}', gradient_colors, N=num_events)
-            colors = [cmap(j/(num_events-1)) for j in range(num_events)] if num_events > 1 else [to_rgb(gradient_colors[0])]
-
-            fig_subset, ax_subset = plt.subplots(figsize=(10, 6))
-            for j, col in enumerate(subset_data.columns):
-                ax_subset.plot(epoc_ts_subset, subset_data[col], color=colors[j], linewidth=1.5, zorder=j+1)
-
-            ax_subset.axhline(0, color='white', linestyle=':', linewidth=1)
-            ax_subset.plot([0, 0],
-                           [np.nanmin(subset_data.values), np.nanmax(subset_data.values)],
-                           'r', linewidth=2)
-
-            # Bars relative to raw data
-            subset_max = np.nanmax(subset_data.values)
-            bar_bottom = subset_max * 2
-            bar_top = subset_max * 2.2
-            label_y = bar_top + 0.03 * subset_max
-
-            # Cue bar
-            ax_subset.fill_between([0, cue_duration], bar_bottom, bar_top, color='yellow', alpha=0.3)
-            ax_subset.text(0.05, label_y, 'cue light', color='yellow', va='bottom')
-
-            # Approach bar
-            if approach_window is not None:
-                ax_subset.fill_between([approach_window[0], approach_window[1]], bar_bottom, bar_top,
-                                       color='magenta', alpha=0.3)
-                ax_subset.text(-3, label_y, 'approach', color='magenta', va='bottom')
-
-            ax_subset.set_title(f'Subset event traces {start_idx} to {end_idx}')
-            ax_subset.set_xlabel('Time (s)')
-            ax_subset.set_ylabel('Signal')
-            #plt.tight_layout()
-
-            subset_figs.append(fig_subset)
-    
-    # ----------------------------------------------------------
-    # Stats
-    # ----------------------------------------------------------
-    GCaMP_465_epocs_mean_std_sem = pd.DataFrame({
-        'mean_epoc_stream': mean_epoc_stream,
-        'std_epoc_stream':  std_epoc_stream,
-        'sem_epoc_stream':  sem_epoc_stream
-    })
-
-    # Cue window stats
-    cue_start_idx = np.searchsorted(epoc_ts, cue_window[0])
-    cue_end_idx   = np.searchsorted(epoc_ts, cue_window[1])
-    cue_vals = data_to_use.iloc[cue_start_idx:cue_end_idx]
-    cue_window_mean = np.nanmean(cue_vals.values)
-    cue_means_per_event = np.nanmean(cue_vals, axis=0)
-    if len(cue_means_per_event) >= 2:
-        cue_window_sem = stats.sem(cue_means_per_event, nan_policy="omit")
-    else:
-        cue_window_sem = np.nan
-
-    # Pre-event AUC
-    pre_vals = []
-    for col in data_to_use.columns:
-        trace = data_to_use[col].iloc[pre_start_idx:pre_end_idx]
-        ts_seg = epoc_ts[pre_start_idx:pre_end_idx]
-        pre_vals.append(np.trapz(trace, ts_seg))
-
-    auc_pre_values = np.array(pre_vals)
-    auc_pre_mean = np.nanmean(auc_pre_values)
-    if len(auc_pre_values) >= 2:
-        auc_pre_sem = stats.sem(auc_pre_values, nan_policy='omit')
-    else:
-        auc_pre_sem = np.nan
-
-    # Post-event AUC
-    post_vals = []
-    for col in data_to_use.columns:
-        trace = data_to_use[col].iloc[post_start_idx:post_end_idx]
-        ts_seg = epoc_ts[post_start_idx:post_end_idx]
-        post_vals.append(np.trapz(trace, ts_seg))
-
-    auc_post_values = np.array(post_vals)
-    auc_post_mean = np.nanmean(auc_post_values)
-    if len(auc_post_values) >= 2:
-        auc_post_sem = stats.sem(auc_post_values, nan_policy='omit')
-    else:
-        auc_post_sem = np.nan
-
-    # Approach window stats
-    if approach_window is not None:
-        a_start = np.searchsorted(epoc_ts, approach_window[0])
-        a_end   = np.searchsorted(epoc_ts, approach_window[1])
-        a_vals = data_to_use.iloc[a_start:a_end]
-        approach_window_mean = np.nanmean(a_vals.values)
-        approach_means = np.nanmean(a_vals, axis=0)
-
-        if len(approach_means) >= 2:
-            approach_window_sem = stats.sem(approach_means, nan_policy='omit')
-        else:
-            approach_window_sem = np.nan
-            
-    else:
-        approach_window_mean = np.nan
-        approach_window_sem  = np.nan
-
-    return (
-        GCaMP_465_epocs,
-        GCaMP_465_epocs_baselined,
-        GCaMP_465_epocs_mean_std_sem,
-        mean_epoc_stream,
-        std_epoc_stream,
-        sem_epoc_stream,
-        fig_5,
-        fig_15,
-        (cue_window_mean, cue_window_sem),
-        (auc_pre_mean, auc_pre_sem),
-        (auc_post_mean, auc_post_sem),
-        (approach_window_mean, approach_window_sem),
-        subset_figs
-    )
-
-
-
-
-# extract stream data flanking each epoc event, average and plot ---------------------------------------------------------------------
-
-# added the 'event' input
-# updated 04.29.25 to adjust a few things
-
-    # Issue	Fix
-    # Wrong use of abs() in epoch range	Replace with proper signed math
-    # NaN check drops columns redundantly	Move dropna() out of the loop
-    # Stats computed before NaN drop	Move after drop or use skipna
-    # Out-of-bounds indexing not checked	Add guard for start, end
-    # Legend handling hardcoded	Use label= and ax.legend()
-
-    # this allows a subset of events to be examined
-
-# 06.24.25:  modification to measure mean fluorescence and AUC aligned to events of interest
-# 08.14.25: modified to include a baseline subtraction step to better align perievent traces, and to add approach window
-# 11.13.25: updated to include two AUC windows
-# 11.14.25 inclues events that fall beyond bounds instead of discarding, pads with NaNs 
-
-
-def epoc_streams_111725(
-    epoc_ts_and_indices,
-    trange,
-    stream,
-    new_fs,
-    ts,
-    event,
-    tzoom,
-    cue_duration,
-    subset=None,
-    cue_window=(0, 4),
-    auc_pre_window=(-3, 0),
-    auc_post_window=(0, 4),
-    approach_window=None,
-    plot_auc_region=False,
-    baseline_trange=None
-    ):
-
-    # Initialize DataFrame to store concatenated epochs
-    GCaMP_465_epocs = pd.DataFrame()
-
-    # Filter the relevant epoc indices
-    event_indices = epoc_ts_and_indices['epoc_indices'][epoc_ts_and_indices['event'] == event]
-
-    # Apply subset restriction if specified
-    if subset is not None:
-        if isinstance(subset, int):
-            event_indices = event_indices.iloc[:subset]
-        elif isinstance(subset, str) and subset.startswith("last"):
-            num = int(subset.replace("last", ""))
-            event_indices = event_indices.iloc[-num:]
-        elif isinstance(subset, (tuple, list)) and len(subset) == 2:
-            event_indices = event_indices.iloc[subset[0]:subset[1]]
-        else:
-            raise ValueError("Invalid subset format.")
-
-    # ----------------------------------------------------------
-    # ✅ Minimal Change #1: Pad out-of-bounds epochs with NaNs
-    # ----------------------------------------------------------
-    win_len = int(trange[1] * new_fs)
-
-    for onset in event_indices:
-        start = int(onset + trange[0] * new_fs)
-        end   = start + win_len
-
-        epoch = np.full(win_len, np.nan)
-
-        valid_start = max(start, 0)
-        valid_end   = min(end, len(stream))
-
-        epoch_start_idx = valid_start - start
-        epoch_end_idx   = epoch_start_idx + (valid_end - valid_start)
-
-        epoch[epoch_start_idx:epoch_end_idx] = stream[valid_start:valid_end]
-
-        epoch_series = pd.Series(epoch, name=f'onset_{onset/new_fs:.3f}s')
-        GCaMP_465_epocs = pd.concat([GCaMP_465_epocs,
-                                     epoch_series.reset_index(drop=True)], axis=1)
-
-    print("Number of events found:", len(event_indices))
-
-    if GCaMP_465_epocs.empty:
-        print("No valid epochs found. Skipping stats and plotting.")
-        return (
-            GCaMP_465_epocs, None, pd.DataFrame(),
-            np.array([]), np.array([]), np.array([]),
-            None, None,
-            (np.nan, np.nan),
-            (np.nan, np.nan),
-            (np.nan, np.nan),
-            (np.nan, np.nan)
-        )
-
-    if GCaMP_465_epocs.shape[1] <= 2:
-        print(f"Warning: Only {GCaMP_465_epocs.shape[1]} valid epoch(s). Plotting will proceed.")
-
-    # Detect & drop all-NaN columns (bad events)
-    if GCaMP_465_epocs.isna().any().any():
-        na_cols = GCaMP_465_epocs.columns[GCaMP_465_epocs.isna().all()]
-        if len(na_cols) > 0:
-            print("Dropping all-NaN event columns:", na_cols.tolist())
-        GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=na_cols)
-
-    # Keep all rows (you asked for padding rather than row dropping)
-    # ------------------------------------------------------
-
-    # ------------------------------------------------------
-    # Baseline subtraction WITH valid baseline requirement
-    # ------------------------------------------------------
-    if baseline_trange is not None:
-        baseline_start_time = baseline_trange[0]
-        baseline_end_time   = baseline_trange[1]
-
-        baseline_start_idx = int((baseline_start_time - trange[0]) * new_fs)
-        baseline_end_idx   = int((baseline_end_time   - trange[0]) * new_fs)
-
-        if baseline_start_idx < 0 or baseline_end_idx > GCaMP_465_epocs.shape[0]:
-            raise ValueError("Baseline range is out of bounds relative to extracted segments.")
-
-        baseline_slice = GCaMP_465_epocs.iloc[baseline_start_idx:baseline_end_idx]
-
-        # --- NEW: require ≥50% non-NaN per event ---
-        valid_fraction = baseline_slice.notna().sum(axis=0) / len(baseline_slice)
-
-        # columns failing validation:
-        bad_cols = valid_fraction[valid_fraction < 0.1].index.tolist()
-        if len(bad_cols) > 0:
-            print(f"Dropping {len(bad_cols)} events: insufficient baseline samples (<10%).")
-            GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=bad_cols)
-            baseline_slice   = baseline_slice.drop(columns=bad_cols)
-
-        # Now safe to compute baseline means
-        baselines = baseline_slice.mean()
-        GCaMP_465_epocs_baselined = GCaMP_465_epocs.subtract(baselines, axis=1)
-
-    else:
-        print("no baseline correction requested")
-        GCaMP_465_epocs_baselined = None
-
-    
-    data_to_use = GCaMP_465_epocs_baselined if GCaMP_465_epocs_baselined is not None else GCaMP_465_epocs
-
-    mean_epoc_stream = np.nanmean(data_to_use, axis=1)
-   
-    num_epochs = data_to_use.shape[1]
-
-    if num_epochs >= 2:
-        std_epoc_stream  = np.nanstd(data_to_use, axis=1, ddof=1)
-        sem_epoc_stream  = stats.sem(data_to_use, axis=1, nan_policy="omit")
-    else:
-        std_epoc_stream = np.full(data_to_use.shape[0], np.nan)
-        sem_epoc_stream = np.full(data_to_use.shape[0], np.nan)
-        print("⚠ Only one valid epoch left — STD and SEM cannot be computed.")
-
-    ticks = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == event]
-    drugavail = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == 'drug available onset']
-
-    fig_15, ax1 = plt.subplots(1, 1, figsize=(10, 7))
-    ax1.plot(ts, stream, color='r')
-    ax1.set_xlim(tzoom)
-    
-    epoc_ts = trange[0] + np.arange(0, len(mean_epoc_stream)) / new_fs
-    fig_5, ax2 = plt.subplots(1, 1, figsize=(10, 7))
-
-    # Grey single-event traces
-    ax2.plot(epoc_ts, data_to_use, color=(0.4, 0.4, 0.4), linewidth=0.5, zorder=1)
-
-
-    ax2.axhline(0, color='white', linestyle=':', linewidth=1)
-    ax2.plot([0, 0],
-             [np.nanmin(data_to_use.values), np.nanmax(data_to_use.values)],
-             'r', linewidth=3)
-
-    # Cue bar
-    ax2.fill_between([0, cue_duration],
-                     np.nanmax(data_to_use.values)*0.9,
-                     np.nanmax(data_to_use.values)*1.0,
-                     color='yellow', alpha=0.3)
-    ax2.text(1.4, np.nanmax(data_to_use.values)*1.03,
-             'cue light', color='yellow')
-
-    # Approach bar
-    if approach_window is not None:
-        ax2.fill_between([approach_window[0], approach_window[1]],
-                         np.nanmax(data_to_use.values)*0.9,
-                         np.nanmax(data_to_use.values)*1.0,
-                         color='magenta', alpha=0.3)
-        ax2.text(-3, np.nanmax(data_to_use.values)*1.03,
-             'approach', color='magenta')
-
-    # Mean + SEM
-    ax2.fill_between(epoc_ts,
-                 mean_epoc_stream + sem_epoc_stream,
-                 mean_epoc_stream - sem_epoc_stream,
-                 facecolor=[1, 1, 0], alpha=0.4, zorder=11)
-    ax2.plot(epoc_ts, mean_epoc_stream, color=[1, 1, 0], linewidth=3, zorder=11)
-    ax2.set_ylim(-3,3)
-
-
-    # ----------------------------------------------------------
-    # ✅ Minimal Change #2: AUC shading ON TOP of all traces
-    # ----------------------------------------------------------
-    if plot_auc_region:
-        # PRE
-        pre_start_idx = np.searchsorted(epoc_ts, auc_pre_window[0])
-        pre_end_idx   = np.searchsorted(epoc_ts, auc_pre_window[1])
-        ax2.fill_between(epoc_ts[pre_start_idx:pre_end_idx],
-                         mean_epoc_stream[pre_start_idx:pre_end_idx],
-                         0,
-                         color='green', alpha=0.8,
-                         label='Pre-event AUC', zorder=10)      
-
-        # POST
-        post_start_idx = np.searchsorted(epoc_ts, auc_post_window[0])
-        post_end_idx   = np.searchsorted(epoc_ts, auc_post_window[1])
-        ax2.fill_between(epoc_ts[post_start_idx:post_end_idx],
-                         mean_epoc_stream[post_start_idx:post_end_idx],
-                         0,
-                         color='blue', alpha=0.8,
-                         label='Post-event AUC', zorder=10)
-
-        ax2.legend(loc='upper right')
-
-    # ----------------------------------------------------------
-    # Stats
-    # ----------------------------------------------------------
-    GCaMP_465_epocs_mean_std_sem = pd.DataFrame({
-        'mean_epoc_stream': mean_epoc_stream,
-        'std_epoc_stream':  std_epoc_stream,
-        'sem_epoc_stream':  sem_epoc_stream
-    })
-
-    # Cue window stats
-    cue_start_idx = np.searchsorted(epoc_ts, cue_window[0])
-    cue_end_idx   = np.searchsorted(epoc_ts, cue_window[1])
-    cue_vals = data_to_use.iloc[cue_start_idx:cue_end_idx]
-    cue_window_mean = np.nanmean(cue_vals.values)
-    cue_means_per_event = np.nanmean(cue_vals, axis=0)
-    if len(cue_means_per_event) >= 2:
-        cue_window_sem = stats.sem(cue_means_per_event, nan_policy="omit")
-    else:
-        cue_window_sem = np.nan
-
-    # Pre-event AUC
-    pre_vals = []
-    for col in data_to_use.columns:
-        trace = data_to_use[col].iloc[pre_start_idx:pre_end_idx]
-        ts_seg = epoc_ts[pre_start_idx:pre_end_idx]
-        pre_vals.append(np.trapz(trace, ts_seg))
-
-    auc_pre_values = np.array(pre_vals)
-    auc_pre_mean = np.nanmean(auc_pre_values)
-    if len(auc_pre_values) >= 2:
-        auc_pre_sem = stats.sem(auc_pre_values, nan_policy='omit')
-    else:
-        auc_pre_sem = np.nan
-
-    # Post-event AUC
-    post_vals = []
-    for col in data_to_use.columns:
-        trace = data_to_use[col].iloc[post_start_idx:post_end_idx]
-        ts_seg = epoc_ts[post_start_idx:post_end_idx]
-        post_vals.append(np.trapz(trace, ts_seg))
-
-    auc_post_values = np.array(post_vals)
-    auc_post_mean = np.nanmean(auc_post_values)
-    if len(auc_post_values) >= 2:
-        auc_post_sem = stats.sem(auc_post_values, nan_policy='omit')
-    else:
-        auc_post_sem = np.nan
-
-    # Approach window stats
-    if approach_window is not None:
-        a_start = np.searchsorted(epoc_ts, approach_window[0])
-        a_end   = np.searchsorted(epoc_ts, approach_window[1])
-        a_vals = data_to_use.iloc[a_start:a_end]
-        approach_window_mean = np.nanmean(a_vals.values)
-        approach_means = np.nanmean(a_vals, axis=0)
-
-        if len(approach_means) >= 2:
-            approach_window_sem = stats.sem(approach_means, nan_policy='omit')
-        else:
-            approach_window_sem = np.nan
-            
-    else:
-        approach_window_mean = np.nan
-        approach_window_sem  = np.nan
-
-    return (
-        GCaMP_465_epocs,
-        GCaMP_465_epocs_baselined,
-        GCaMP_465_epocs_mean_std_sem,
-        mean_epoc_stream,
-        std_epoc_stream,
-        sem_epoc_stream,
-        fig_5,
-        fig_15,
-        (cue_window_mean, cue_window_sem),
-        (auc_pre_mean, auc_pre_sem),
-        (auc_post_mean, auc_post_sem),
-        (approach_window_mean, approach_window_sem)
-    )
-
-
-
-    
-
-# extract stream data flanking each epoc event, average and plot ---------------------------------------------------------------------
-
-# maybe useful, added a bit to generate "random" events for comparison
-
- 
-
-def epoc_streams_with_random(epoc_ts_and_indices, trange, stream, new_fs, ts, event, tzoom, subset=None, random_event_count=100):
-    # Initialize DataFrames
-    real_epocs = pd.DataFrame()
-    random_epocs = pd.DataFrame()
-
-    # Get real event indices
-    event_indices = epoc_ts_and_indices['epoc_indices'][epoc_ts_and_indices['event'] == event]
-
-    # Apply subset filter if provided
-    if subset is not None:
-        if isinstance(subset, int):
-            event_indices = event_indices.iloc[:subset]
-        elif isinstance(subset, str) and subset.startswith("last"):
-            num = int(subset.replace("last", ""))
-            event_indices = event_indices.iloc[-num:]
-        elif isinstance(subset, (tuple, list)) and len(subset) == 2:
-            event_indices = event_indices.iloc[subset[0]:subset[1]]
-
-    # Extract real epochs
-    for onset in event_indices:
-        start = int(onset + trange[0] * new_fs)
-        end = int(onset + trange[1] * new_fs)
-        if start < 0 or end > len(stream):
-            continue
-        epoch_data = stream[start:end]
-        real_epocs[f'onset_{onset/new_fs:.3f}s'] = epoch_data
-
-    if real_epocs.shape[1] <= 2:
-        return real_epocs, pd.DataFrame(), random_epocs, pd.DataFrame(), None
-
-    real_epocs = real_epocs.dropna(axis=1)
-
-    # Compute real stats
-    mean_real = np.mean(real_epocs, axis=1)
-    std_real = np.nanstd(real_epocs, axis=1, ddof=1)
-    sem_real = stats.sem(real_epocs, axis=1, nan_policy="omit")
-    real_stats = pd.DataFrame({
-        'mean': mean_real,
-        'std': std_real,
-        'sem': sem_real
-    })
-
-    # Create random events
-    epoch_length = int((trange[1] - trange[0]) * new_fs)
-    valid_range = len(stream) - epoch_length
-    random_indices = np.random.randint(0, valid_range, size=random_event_count)
-
-    for idx in random_indices:
-        start = idx
-        end = idx + epoch_length
-        epoch_data = stream[start:end]
-        random_epocs[f'random_{idx/new_fs:.3f}s'] = epoch_data
-
-    # Compute random stats
-    mean_random = np.mean(random_epocs, axis=1)
-    std_random = np.nanstd(random_epocs, axis=1, ddof=1)
-    sem_random = stats.sem(random_epocs, axis=1, nan_policy="omit")
-    random_stats = pd.DataFrame({
-        'mean': mean_random,
-        'std': std_random,
-        'sem': sem_random
-    })
-
-    # Plot comparison
-    epoc_ts = trange[0] + np.arange(0, len(mean_real)) / new_fs
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.fill_between(epoc_ts, mean_random + sem_random, mean_random - sem_random, alpha=0.2, color='gray', label='Random SEM')
-    ax.plot(epoc_ts, mean_random, color='gray', linestyle='--', linewidth=2, label='Mean Random')
-    ax.fill_between(epoc_ts, mean_real + sem_real, mean_real - sem_real, alpha=0.3, color='yellow', label='Real SEM')
-    ax.plot(epoc_ts, mean_real, color='orange', linewidth=3, label='Mean Real')
-    ax.axvline(0, color='red', linewidth=2, linestyle='--', label='Event Onset')
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Fluorescence (z-score)')
-    ax.set_title(f'Peri-Event Comparison: {event} vs Random ({random_event_count} events)')
-    ax.legend()
-    ax.set_ylim([-5, 5])
-    ax.axis('tight')
-
-    return real_epocs, real_stats, random_epocs, random_stats, fig
 
     
 # load preprocessed epoc streams data for stats and plotting ---------------------------------------------------------------------    
