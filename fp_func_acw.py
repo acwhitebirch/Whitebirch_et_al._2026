@@ -1,3 +1,6 @@
+# test git methods
+
+
 ## began in-depth review and documentation update, 07.17.26
 
 ## initial imports
