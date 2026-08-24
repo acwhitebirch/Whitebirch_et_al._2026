@@ -4782,6 +4782,8 @@ def epoc_streams(
         ax2.text(approach_window[0], label_y, 'approach', color='magenta', va='bottom')
 
     
+    # bounds of the AUC windows
+    
     pre_start_idx = np.searchsorted(epoc_ts, auc_pre_window[0])
     pre_end_idx   = np.searchsorted(epoc_ts, auc_pre_window[1])
     post_start_idx = np.searchsorted(epoc_ts, auc_post_window[0])
@@ -4883,6 +4885,8 @@ def epoc_streams(
     else:
         cue_window_sem = np.nan
 
+    # use np.trapz to measure the area under the curve
+    # inputs are the steam data and the epoc_ts in the identified indices
     # Pre-event AUC
     pre_vals = []
     for col in data_to_use.columns:
