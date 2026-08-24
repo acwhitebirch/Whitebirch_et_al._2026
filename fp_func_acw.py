@@ -4525,6 +4525,7 @@ def detect_peaks(
 # 11.14.25: includes events that fall beyond bounds instead of discarding, pads with NaNs 
 # 01.31.26: updated to loop over data and event types, and include randoms
 # 08.21.26: deleted associated random event and circular shift functions, as I didn't end up using them
+# 08.24.26: updating documentation
 
 
 def epoc_streams(
@@ -4551,7 +4552,9 @@ def epoc_streams(
     # Initialize DataFrame to store concatenated epochs
     GCaMP_465_epocs = pd.DataFrame()
 
-    # Filter the relevant epoc indices
+    # Use a boolean mask to filter the relevant epoc indices, 
+    #e.g. only the indices from rows in which event = "Drug Infusion"
+    
     event_indices = epoc_ts_and_indices['epoc_indices'][epoc_ts_and_indices['event'] == event]
 
     # Apply subset restriction if specified
@@ -4567,7 +4570,7 @@ def epoc_streams(
             raise ValueError("Invalid subset format.")
 
     # ----------------------------------------------------------
-    # ✅ Minimal Change #1: Pad out-of-bounds epochs with NaNs
+    # Pad out-of-bounds epochs with NaNs rather than discard
     # ----------------------------------------------------------
     win_len = int(trange[1] * new_fs)
 
@@ -4620,16 +4623,15 @@ def epoc_streams(
             print("Dropping all-NaN event columns:", na_cols.tolist())
         GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=na_cols)
 
-    # Keep all rows (you asked for padding rather than row dropping)
-    # ------------------------------------------------------
 
     # ------------------------------------------------------
-    # Baseline subtraction WITH valid baseline requirement
+    # Baseline subtraction with valid baseline requirement
     # ------------------------------------------------------
     if baseline_trange is not None:
         baseline_start_time = baseline_trange[0]
         baseline_end_time   = baseline_trange[1]
 
+        # indices to use for baseline subtraction
         baseline_start_idx = int((baseline_start_time - trange[0]) * new_fs)
         baseline_end_idx   = int((baseline_end_time   - trange[0]) * new_fs)
 
@@ -4648,7 +4650,7 @@ def epoc_streams(
             GCaMP_465_epocs = GCaMP_465_epocs.drop(columns=bad_cols)
             baseline_slice   = baseline_slice.drop(columns=bad_cols)
 
-        # Now safe to compute baseline means
+        # Now safe to compute baseline means and subtract for each column / epoch
         baselines = baseline_slice.mean()
         GCaMP_465_epocs_baselined = GCaMP_465_epocs.subtract(baselines, axis=1)
 
@@ -4659,6 +4661,7 @@ def epoc_streams(
     
     data_to_use = GCaMP_465_epocs_baselined if GCaMP_465_epocs_baselined is not None else GCaMP_465_epocs
 
+    # the mean trace is computed along axis = 1, aka mean across columns/events at each timepoint
     mean_epoc_stream = np.nanmean(data_to_use, axis=1)
    
     num_epochs = data_to_use.shape[1]
@@ -4671,7 +4674,9 @@ def epoc_streams(
         sem_epoc_stream = np.full(data_to_use.shape[0], np.nan)
         print("⚠ Only one valid epoch left — STD and SEM cannot be computed.")
     
-
+    #---------------------
+    # plotting, full stream
+    
     ticks = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == event]
     drugavail = epoc_ts_and_indices['epoc_ts'][epoc_ts_and_indices['event'] == 'drug available onset']
 
@@ -4686,7 +4691,6 @@ def epoc_streams(
     if label is not None:
         ax1.set_title(label)
 
-    
     # --- plot event ticks ---
     # Plot event ticks for chosen event
     for t in ticks:
@@ -4698,14 +4702,18 @@ def epoc_streams(
         if tzoom[0] <= t <= tzoom[1]:
             ax1.plot(t, np.nanmax(stream), '|', markersize=18, color='c', zorder=10)
     
+    
+
+    #---------------------
+    # plot perievent epochs
+    
     epoc_ts = trange[0] + np.arange(0, len(mean_epoc_stream)) / new_fs
         
     fig_5, ax2 = plt.subplots(1, 1, figsize=(10, 7))
     if label is not None:
         ax2.set_title(f"{label}\nPeri-event aligned traces", fontsize=12)
 
-    
-
+     
     # ------------------------------
     # Grey single-event traces
     # ------------------------------
