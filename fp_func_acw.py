@@ -4951,6 +4951,2893 @@ def epoc_streams(
 
 
 
+# concatenate partial multiple recording segments from single animals ---------------------------------------------------------------------    
+# 01.23.26, update to include individual epoc data in outputs for later mixed model analysis potentially
+# 02.02.26 udpate to show within animal means, across animal means as separate plots 
+# updating 02.19.26 to add new output for event latency, count by file
+# updating documentation 08.25.26
+
+'''
+run_perievent_pipeline is a large orchestration function, which at it's core uses perievent_analysis() to analyze preprocessed event-aligned photometry data
+
+key steps:
+
+1. Organize matched Feather files by rat and generate file-level event summaries.
+2. tier 1: WITHIN-RAT:
+   For each rat, call `perievent_analysis()` on that rat's files.
+   Store per-rat epocs, statistics, traces, and optional figures.
+3. tier 2: ACROSS-TRIAL:
+   Call `perievent_analysis()` once on all matched files.
+   Generate pooled trial-level epocs, statistics, summaries, and figures.
+4. tier 3: ACROSS-ANIMAL:
+   Aggregate the per-rat results from Step 2 to calculate
+   animal-level means, SEMs, time-resolved traces, and summary statistics.
+5. Save requested tables/figures and return all results in `pipeline_results`.
+
+    matched files
+         │ 
+         ├──► group by rat
+         │
+         ▼
+    ┌──────────────────────────────┐
+    │ WITHIN-RAT                   │
+    │ perievent_analysis() × rats  │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+            per-rat results
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │ ACROSS-ANIMAL                │
+    │ aggregate per-rat results    │
+    └──────────────────────────────┘
+
+    matched files (all)
+         │
+         ▼
+    ┌──────────────────────────────┐
+    │ ACROSS-TRIAL                 │
+    │ perievent_analysis()         │
+    │ on all files                 │
+    └──────────────────────────────┘
+
+    Returns a large dictionary containing within-rat, across-trial, across-animal, summary-statistic, and figure outputs.
+
+
+'''
+
+
+def run_perievent_pipeline(
+    matched_files,
+    save_dir,
+    processed_phase,
+    eventname,
+    subset=None,
+    *,
+    compute_kwargs,
+    overwrite=False,
+    save_within_rat=False,
+    master_xlim = None,
+    master_ylim = None,
+    excel_file_path = None,
+    plot_group_comparison=True,
+    plot_baseline_significance=True,
+    paperfigs = False,
+    paperfig_path = None,
+    master_figsize = (2,2),
+    plot_onset_detection=False,
+):
+    import os
+    import pandas as pd
+    import numpy as np
+    from collections import defaultdict
+    from pathlib import Path
+    import re
+    from scipy import stats
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+    from matplotlib.patches import Patch
+    from matplotlib.patches import Rectangle
+    from matplotlib.lines import Line2D
+    from matplotlib.legend_handler import HandlerTuple
+
+    #########################################################################################################
+
+    def configure_figure_style(paperfigs=False, master_figsize=(8,8)):
+    
+        if paperfigs:
+            plt.style.use("default")
+
+            plt.rcParams.update({
+                "figure.facecolor": "none",
+                "axes.facecolor": "none",
+                "axes.edgecolor": "black",
+                "axes.labelcolor": "black",
+                "text.color": "black",
+                "xtick.color": "black",
+                "ytick.color": "black",
+                "grid.color": "0.85",
+                "axes.spines.top": False,
+                "axes.spines.right": False,
+                "figure.figsize": master_figsize,
+                "savefig.facecolor": "none",
+                "font.size": 7,
+                "axes.titlesize": 8,
+                "axes.labelsize": 7,
+                "xtick.labelsize": 7,
+                "ytick.labelsize": 7,
+            })
+
+        else:
+            plt.style.use("dark_background")
+            
+    configure_figure_style(
+        paperfigs=paperfigs,
+        master_figsize=master_figsize
+    )
+    
+
+    def configure_axis(ax):
+        ax.yaxis.set_major_locator(MultipleLocator(1))
+        ax.minorticks_off()
+
+    def get_output_path(default_path, paperfigs, paperfig_path):
+
+        if paperfigs:
+            os.makedirs(paperfig_path, exist_ok=True)
+            return paperfig_path
+        else:
+            os.makedirs(default_path, exist_ok=True)
+            return default_path
+        
+    fig_output_path = get_output_path(
+        save_dir,
+        paperfigs,
+        paperfig_path
+    )
+    
+    #########################################################################################################
+    
+    # ---------------------------------
+    # Handle optional analysis window
+    # ---------------------------------
+
+    compute_kwargs_local = compute_kwargs.copy()
+
+    # -----------------------------
+    # Determine final time range
+    # -----------------------------
+    analysis_trange = compute_kwargs_local.pop("analysis_trange", None)
+
+    if analysis_trange is not None:
+        start, duration = analysis_trange
+    else:
+        start, duration = compute_kwargs_local.get("trange", [-10, 25])
+
+    # If trange is meant as [start, duration], compute end
+    end = start + duration
+
+    # Save final trange back
+    trange_to_use = [start, end]
+    compute_kwargs_local["trange"] = trange_to_use
+
+    fs = compute_kwargs_local.get("new_fs", 20.0)  # sampling frequency
+    n_samples = int(duration * fs)  # number of samples based on duration
+
+    ts = np.linspace(start, end, n_samples, endpoint=False)  # use endpoint=False for exact duration
+
+
+        
+    # ----------------------
+    # Helper: safe feather/csv save
+    # ----------------------
+    def safe_save(df, path):
+        if df is None:
+            return False
+        if os.path.exists(path) and not overwrite:
+            print(f"↪️  Reusing existing file: {os.path.basename(path)}")
+            return False
+        df = df.reset_index(drop=True)
+        df.columns = df.columns.astype(str)
+        df.to_feather(path)
+        print(f"💾 Saved: {os.path.basename(path)}")
+        return True
+
+    def safe_save_table(df, base_path):
+        """
+        Save a DataFrame safely to Feather and CSV, ensuring Feather-compatible types.
+        Converts all object columns to strings to avoid ArrowTypeError.
+        """
+        import os
+        if df is None:
+            return False
+
+        feather_path = base_path + ".feather"
+        csv_path     = base_path + ".csv"
+
+        # Reset index and ensure column names are strings
+        df = df.reset_index(drop=True)
+        df.columns = df.columns.astype(str)
+
+        # Convert any object columns to string to prevent ArrowTypeError
+        for col in df.select_dtypes(include=['object']).columns:
+            df[col] = df[col].astype(str)
+
+        # Save Feather
+        if not os.path.exists(feather_path) or overwrite:
+            df.to_feather(feather_path)
+            print(f"💾 Saved: {os.path.basename(feather_path)}")
+        else:
+            print(f"↪️  Reusing existing file: {os.path.basename(feather_path)}")
+
+        # Save CSV
+        if not os.path.exists(csv_path) or overwrite:
+            df.to_csv(csv_path, index=False)
+            print(f"💾 Saved: {os.path.basename(csv_path)}")
+        else:
+            print(f"↪️  Reusing existing file: {os.path.basename(csv_path)}")
+
+        return True
+
+
+    def safe_save_txt(text, path):
+        if text is None:
+            return False
+        if os.path.exists(path) and not overwrite:
+            print(f"↪️  Reusing existing file: {os.path.basename(path)}")
+            return False
+        with open(path, "w") as f:
+            f.write(text)
+        print(f"💾 Saved: {os.path.basename(path)}")
+        return True
+
+    
+    def safe_save_fig(fig, path_base):
+        """
+        Saves figure as PNG, PDF, and SVG automatically.
+        `path_base` should NOT include extension.
+        Example: safe_save_fig(fig, "my_figure")
+        """
+
+        if fig is None:
+            return False
+
+        # --- Illustrator-friendly font settings ---
+        mpl.rcParams['pdf.fonttype'] = 42      # Keep text editable in PDF
+        mpl.rcParams['ps.fonttype'] = 42
+        mpl.rcParams['svg.fonttype'] = 'none'  # Keep text editable in SVG
+
+        saved_any = False
+
+        formats = {
+            "png": {"dpi": 600},
+            "pdf": {},
+            "svg": {}
+        }
+
+        for ext, kwargs in formats.items():
+            full_path = f"{path_base}.{ext}"
+
+            if os.path.exists(full_path) and not overwrite:
+                print(f"↪️  Reusing existing figure: {os.path.basename(full_path)}")
+                continue
+
+            fig.savefig(
+                full_path,
+                bbox_inches='tight',
+                transparent= True,
+                facecolor= None,
+                edgecolor="none",
+                **kwargs
+            )
+
+            print(f"🖼️  Saved: {os.path.basename(full_path)}")
+            saved_any = True
+
+        return saved_any
+
+
+    # ----------------------
+    # Parse rat from filename
+    # ----------------------
+    def parse_rat(filename):
+        fname = Path(filename).stem
+        rat_match = re.search(r'ACW_coh5_IT_[fm]\d+', fname)
+        return rat_match.group(0) if rat_match else "unknown_rat"
+
+    # ----------------------
+    # Group files by rat
+    # ----------------------
+    rat_files = defaultdict(list)
+    for f in matched_files:
+        rat_files[parse_rat(f)].append(f)
+
+    print(f"\n🐀 Detected {len(rat_files)} rat(s): {list(rat_files.keys())}")
+
+    # ----------------------
+    # Initialize storage
+    # ----------------------
+    per_rat_stats = {}
+    per_rat_results = {}
+    per_animal_traces = []
+    per_rat_epoc_tables = []
+
+    # ----------------------
+    # NEW OUTPUT: File-level summary table with first onset times and event count e.g. for correlation with drug_avail signals
+    # ----------------------
+    file_summary_rows = []
+
+    onset_pattern = re.compile(r"onset_([0-9.]+)s")
+
+    for rat in sorted(rat_files.keys()):
+        for f in sorted(rat_files[rat]):
+
+            df = pd.read_feather(f)
+
+            # Extract onset times from column headers
+            onset_times = []
+            for col in df.columns:
+                match = onset_pattern.search(str(col))
+                if match:
+                    onset_times.append(float(match.group(1)))
+
+            if len(onset_times) > 0:
+                first_event_onset_sec = min(onset_times)
+            else:
+                first_event_onset_sec = np.nan
+
+            n_events = len(onset_times)
+
+            file_summary_rows.append({
+                "rat_id": rat,
+                "matched_file": Path(f).name,
+                "first_event_onset_sec": first_event_onset_sec,
+                "n_events": n_events
+            })
+
+    file_summary_df = (
+        pd.DataFrame(file_summary_rows)
+        .sort_values(["rat_id", "matched_file"])
+        .reset_index(drop=True)
+    )
+
+    # Save file-level summary
+    file_summary_base = os.path.join(
+        save_dir,
+        f"{processed_phase}_{eventname}_file_level_summary"
+    )
+
+    safe_save_table(file_summary_df, file_summary_base)
+        
+    # -------------------
+    # Tier 1: per-rat processing
+    # -------------------
+    #compute_kwargs_local = compute_kwargs.copy()
+    #analysis_trange = compute_kwargs_local.pop("analysis_trange", None)
+
+    
+    for rat, files in rat_files.items():
+        (
+            combined_epocs,
+            combined_baselined,
+            combined_stats,
+            mean_stream,
+            std_stream,
+            sem_stream,
+            _fig_trial,
+            _fig_across,
+            _fig_within,
+            _fig_onset,
+            fig_trials,
+            (cue_mean, cue_sem),
+            (auc_pre_mean, auc_pre_sem),
+            (auc_post_mean, auc_post_sem),
+            (approach_mean, approach_sem),
+            (onset_mean, onset_sem), 
+            (slope_mean, slope_sem),  
+            (time_to_peak_mean, time_to_peak_sem),
+            (onset_peak_amp_mean, onset_peak_amp_sem),
+            (overall_peak_amp_mean, overall_peak_amp_sem),
+            (overall_peak_time_mean, overall_peak_time_sem),
+            per_epoc_stats_df
+        ) = perievent_analysis(
+            feather_files=files,
+            subset=subset,
+            **compute_kwargs_local,
+            plot=False,
+            plot_onset_detection=False,
+            master_xlim = master_xlim,
+            master_ylim = master_ylim,
+            overall_peak_window = (0,8),
+            rat_name = rat,
+            excel_file_path = excel_file_path,
+            plot_group_comparison=plot_group_comparison,
+            plot_baseline_significance=plot_baseline_significance,
+            paperfigs = paperfigs,
+            master_figsize = master_figsize
+        )
+
+            
+        # Add rat metadata
+        per_epoc_stats_df["rat_id"] = rat
+        per_rat_epoc_tables.append(per_epoc_stats_df)
+
+        per_rat_results[rat] = {
+            "epocs": combined_epocs,
+            "baselined_epocs": combined_baselined,
+            "stats": combined_stats,
+            "per_epoc_stats": per_epoc_stats_df
+        }
+
+        per_rat_stats[rat] = {
+            "cue_stats": (cue_mean, cue_sem),
+            "approach_stats": (approach_mean, approach_sem),
+            "auc_pre_stats": (auc_pre_mean, auc_pre_sem),
+            "auc_post_stats": (auc_post_mean, auc_post_sem),
+
+            "onset_stats": (onset_mean, onset_sem),
+            "slope_stats": (slope_mean, slope_sem),
+            "time_to_peak_stats": (time_to_peak_mean, time_to_peak_sem),
+            "onset_peak_amp_stats": (onset_peak_amp_mean, onset_peak_amp_sem),
+            
+            "overall_peak_amp_stats": (overall_peak_amp_mean, overall_peak_amp_sem),
+            "overall_peak_time_stats": (overall_peak_time_mean, overall_peak_time_sem),
+        }
+
+        # Store per-animal traces
+        mean_trace = np.nanmean(combined_baselined.values, axis=1)
+
+        n_trials = combined_baselined.shape[1]
+
+        if n_trials > 1:
+            sem_trace = (
+                np.nanstd(combined_baselined.values, axis=1, ddof=1)
+                / np.sqrt(n_trials)
+            )
+        else:
+            # Single-epoc case (e.g. program_start) → no within-animal variability
+            sem_trace = np.zeros_like(mean_trace)
+
+        per_animal_traces.append({
+            "rat": rat,
+            "mean": mean_trace,
+            "sem": sem_trace
+        })
+
+
+        # Save per-rat files
+        rat_base = os.path.join(save_dir, f"{processed_phase}_{rat}_{eventname}")
+        rat_base_fig = os.path.join(fig_output_path, f"{processed_phase}_{rat}_{eventname}")
+        safe_save_table(combined_baselined, rat_base + "_epocs_bslnd")
+        safe_save_table(combined_stats, rat_base + "_stats")
+        safe_save_table(per_epoc_stats_df, rat_base + "_per_epoc_stats")
+       
+
+        # per-rat figures can optionally be saved here
+        if _fig_onset is not None:      
+            safe_save_fig(_fig_onset, rat_base_fig + "_onset_slope")     # temp to assure this is working
+            
+        if fig_trials is not None:
+            safe_save_fig(fig_trials, rat_base_fig + "_individual_trials")
+            
+        
+    # -----------------------
+    # Build within-animal averaged epocs DataFrames
+    # -----------------------
+    #rat_str = "-".join(sorted(per_rat_results.keys()))
+    rat_str = "_".join([r.split('_')[-1] for r in sorted(per_rat_results.keys())])
+    within_base = os.path.join(
+        save_dir,
+        f"{processed_phase}_{rat_str}_{eventname}_within_rat_epoc_bslnd"
+    )
+
+    # Mean trace per rat
+    within_animal_epocs_mean = pd.DataFrame(
+        {trace["rat"]: trace["mean"] for trace in per_animal_traces}
+    )
+    within_animal_epocs_mean.insert(0, "time", ts)
+
+    # SEM trace per rat
+    within_animal_epocs_sem = pd.DataFrame(
+        {trace["rat"]: trace["sem"] for trace in per_animal_traces}
+    )
+    within_animal_epocs_sem.insert(0, "time", ts)
+
+    safe_save_table(within_animal_epocs_mean, within_base + "_means")
+    safe_save_table(within_animal_epocs_sem, within_base + "_sem")
+
+    #########
+    import matplotlib.pyplot as plt
+    
+    for rat in per_rat_stats.keys():
+        trace_dict = next(t for t in per_animal_traces if t["rat"] == rat)
+        mean_trace = trace_dict["mean"]
+        sem_trace = trace_dict["sem"]
+
+        rat_stats = per_rat_stats[rat]
+        onset_mean = rat_stats["onset_stats"][0]
+        slope_mean = rat_stats["slope_stats"][0]
+
+        if plot_onset_detection and per_animal_traces is not None and len(per_animal_traces) > 0:
+            fig, ax = plt.subplots(figsize=master_figsize if paperfigs else (6,4))
+            ax.plot(ts, mean_trace, label="Mean Trace")
+            ax.fill_between(ts, mean_trace - sem_trace, mean_trace + sem_trace, alpha=0.3, linewidth=0,
+                        edgecolor='none')
+
+            # Event vertical line
+            ax.axvline(0, color="red", linestyle="-", label="Event")
+
+            # Onset vertical line
+            if not np.isnan(onset_mean):
+                ax.axvline(onset_mean, linestyle="--", color="magenta", label="Mean Onset")
+
+                # Slice window starting just before onset
+                mask = ts >= onset_mean
+                t_win = ts[mask]
+                y_win = mean_trace[mask]
+
+                # Interpolate y at exact onset
+                y0 = np.interp(onset_mean, ts, mean_trace)
+
+                # Peak-based cutoff
+                onset_peak_val = np.nanmax(y_win)
+                threshold = 0.6 * onset_peak_val
+                above_thresh_idx = np.where(y_win >= threshold)[0]
+
+                if len(above_thresh_idx) > 0:
+                    t_fit = t_win[:above_thresh_idx[0]+1]
+                    slope_line = slope_mean * (t_fit - onset_mean) + y0  # start at interpolated y
+                    ax.plot(t_fit, slope_line, color="green", label="Mean Slope")
+
+            ax.set_title(f"{rat} - Within-Rat Onset & Slope")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Signal (z-score)")
+            ax.set_xlim(-0.5, 2)
+            ax.legend()
+            plt.show()
+        
+        
+    #########
+    # -------------------
+    # Tier 2: across-trial
+    # -------------------
+    all_files = [f for files in rat_files.values() for f in files]
+    (
+        combined_epocs_all,
+        combined_baselined_all,
+        combined_stats_all,
+        mean_all,
+        std_all,
+        sem_all,
+        fig_trial_all,
+        fig_across_all,
+        fig_within_all,
+        fig_onset,
+        fig_trials,
+        (cue_mean_all, cue_sem_all),
+        (auc_pre_mean_all, auc_pre_sem_all),
+        (auc_post_mean_all, auc_post_sem_all),
+        (approach_mean_all, approach_sem_all),
+        (onset_mean_all, onset_sem_all),
+        (slope_mean_all, slope_sem_all),
+        (time_to_peak_mean_all, time_to_peak_sem_all),
+        (onset_peak_amp_mean_all, onset_peak_amp_sem_all),
+        (overall_peak_amp_mean_all, overall_peak_amp_sem_all),
+        (overall_peak_time_mean_all, overall_peak_time_sem_all),
+        per_epoc_stats_all
+    ) = perievent_analysis(
+        feather_files=all_files,
+        subset=subset,
+        **compute_kwargs_local,
+        plot=True,
+        per_animal_traces=per_animal_traces,
+        plot_onset_detection=False,
+        plot_individual_trials = False,
+        master_xlim = master_xlim,
+        master_ylim = master_ylim,
+        overall_peak_window = (0,8),
+        excel_file_path = excel_file_path,
+        plot_group_comparison=plot_group_comparison,
+        plot_baseline_significance=plot_baseline_significance,
+        paperfigs = paperfigs,
+        master_figsize = master_figsize
+
+    )
+
+
+    per_epoc_stats_all = pd.concat(per_rat_epoc_tables, ignore_index=True)
+    #rat_str = "_".join(sorted(per_rat_results.keys()))
+    rat_str = "_".join([r.split('_')[-1] for r in sorted(per_rat_results.keys())])
+    
+    # ---------- Across-trial summary ----------
+    combined_event_dict_trial = {
+        "event name": eventname,
+        "rats included": rat_str,
+        "event count": combined_epocs_all.shape[1],
+        "subset": subset,
+        "approach window (s)": str(compute_kwargs["approach_window"]),
+        "mean approach response": f"{approach_mean_all:.3f}",
+        "SEM approach response": f"{approach_sem_all:.3f}",
+        "cue window (s)": str(compute_kwargs["cue_window"]),
+        "mean cue response": f"{cue_mean_all:.3f}",
+        "SEM cue response": f"{cue_sem_all:.3f}",
+        "pre-event AUC window (s)": str(compute_kwargs["auc_pre_window"]),
+        "mean pre-event AUC": f"{auc_pre_mean_all:.3f}",
+        "SEM pre-event AUC": f"{auc_pre_sem_all:.3f}",
+        "post-event AUC window (s)": str(compute_kwargs["auc_post_window"]),
+        "mean post-event AUC": f"{auc_post_mean_all:.3f}",
+        "SEM post-event AUC": f"{auc_post_sem_all:.3f}",
+        "mean onset latency (s)": f"{onset_mean_all:.3f}",
+        "SEM onset latency (s)": f"{onset_sem_all:.3f}",
+        "mean rise slope": f"{slope_mean_all:.3f}",
+        "SEM rise slope": f"{slope_sem_all:.3f}",
+        "mean time to peak (s)": f"{time_to_peak_mean_all:.3f}",
+        "SEM time to peak (s)": f"{time_to_peak_sem_all:.3f}",
+        "mean onset peak amplitude": f"{onset_peak_amp_mean_all:.3f}",
+        "SEM onset peak amplitude": f"{onset_peak_amp_sem_all:.3f}",
+        "overall peak window (s)": str(compute_kwargs.get("overall_peak_window", (0,8))),
+        "mean overall peak amplitude": f"{overall_peak_amp_mean_all:.3f}",
+        "SEM overall peak amplitude": f"{overall_peak_amp_sem_all:.3f}",
+        "mean overall peak timestamp (s)": f"{overall_peak_time_mean_all:.3f}",
+        "SEM overall peak timestamp (s)": f"{overall_peak_time_sem_all:.3f}",
+    }
+
+    combined_events_info_trial = (
+        pd.DataFrame.from_dict(combined_event_dict_trial, orient="index")
+          .reset_index()
+    )
+    combined_events_info_trial.columns = ["combined perievent analysis", "value"]
+
+    # Matched files
+    matched_file_rows = pd.DataFrame({
+        "combined perievent analysis": ["matched file"] * len(all_files),
+        "value": [Path(f).name for f in all_files]
+    })
+    combined_events_info_trial = pd.concat([matched_file_rows, combined_events_info_trial], ignore_index=True).astype(str)
+
+    # Save across-trial files
+    base_all_trial = os.path.join(save_dir, f"{processed_phase}_{rat_str}_{eventname}_across_trial")
+    base_all_trial_fig = os.path.join(fig_output_path, f"{processed_phase}_{rat_str}_{eventname}_across_trial")
+
+    safe_save_table(combined_baselined_all, base_all_trial + "_epocs_bslnd")
+    safe_save_table(combined_stats_all, base_all_trial + "_stats")
+    safe_save_table(per_epoc_stats_all, base_all_trial + "_PER_EPOC_summary_stats")
+    safe_save_table(combined_events_info_trial, base_all_trial + "_summary")
+    safe_save_txt(combined_events_info_trial.to_string(index=False), base_all_trial + "_summary.txt")
+    
+    safe_save_fig(fig_trial_all, base_all_trial_fig + "_across_trials")
+    safe_save_fig(fig_within_all, base_all_trial_fig + "_within_rats")
+
+    from matplotlib import gridspec
+    from scipy.ndimage import gaussian_filter1d
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+
+    # ------------------------------------------------------------
+    # FIGURE — Heatmap of ALL TRIALS (per-rat trial y-axis, right-aligned rat IDs)
+    # ------------------------------------------------------------
+    
+    
+    x_smooth_sigma = 2
+    gap_between_rats = 10
+    y_offset = 0
+
+    yticks_trial = []
+    yticklabels_trial = []
+    yticks_rat = []
+    yticklabels_rat = []
+
+    # Stack traces to compute color scale
+    within_means = np.vstack([trace["mean"] for trace in per_animal_traces])
+    if master_xlim is not None:
+        x_mask = (ts >= master_xlim[0]) & (ts <= master_xlim[1])
+        ts_plot = ts[x_mask]
+        within_means = within_means[:, x_mask]
+    else:
+        ts_plot = ts
+
+    vlim2 = np.nanmax(np.abs(within_means))
+    vlim = np.nanpercentile(np.abs(within_means), 98)
+    
+    ##############
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
+    # --- Custom diverging colormap ---
+    deep_green = np.array([36, 106, 72]) / 255
+    green = np.array([54, 158, 90]) / 255
+    purple = np.array([60, 30, 90]) / 255
+    white = np.array([1, 1, 1])
+    deep_redpurple = np.array([40, 15, 45]) / 255
+
+    custom_cmap = LinearSegmentedColormap.from_list(
+        "GreenPurple",
+        [deep_redpurple, purple, white, green, deep_green],
+        N=256
+    )
+
+    # Proper zero-centered normalization
+    norm = TwoSlopeNorm(vmin=-vlim, vcenter=0, vmax=vlim)
+    ##############
+    
+    
+
+    # Create figure with GridSpec: heatmap (left), colorbar (right)
+    fig_all_trials = plt.figure(figsize=(2,0.75) if paperfigs else (11,6))
+    gs = gridspec.GridSpec(1, 2, width_ratios=[20, 1], wspace=0.05)
+    ax_left = fig_all_trials.add_subplot(gs[0])
+    ax_cbar = fig_all_trials.add_subplot(gs[1])
+
+
+    '''
+    # Compute a representative peak per rat using the mean across trials
+    rat_peak_scores = {}
+    for rat, trace in per_rat_results.items():
+        df_rat = trace["baselined_epocs"]
+        mean_trace = df_rat.mean(axis=1)  # mean across trials (row-wise)
+        if master_xlim is not None:
+            mean_trace = mean_trace[x_mask]  # apply x-limits if needed
+        rat_peak_scores[rat] = mean_trace.max()  # use max of the mean trace
+
+    # Sort rats by this representative peak (descending)
+    sorted_rats = sorted(rat_peak_scores.keys(), key=lambda r: rat_peak_scores[r], reverse=False)
+    '''
+    
+    # ------------------------------------------------------------
+    # Determine rat order
+    # ------------------------------------------------------------
+
+    subject_order = ["m4","f5","m8","f2","m3","m9","m5"]
+    #subject_order = None
+    
+    if subject_order is not None:
+
+        # Extract short IDs from rat names
+        rat_short = {rat: rat.split("_")[-1] for rat in per_rat_results.keys()}
+
+        # Map manual order to full rat names
+        manual_map = {v: k for k, v in rat_short.items()}
+
+        sorted_rats = []
+        for sid in subject_order:
+            if sid in manual_map:
+                sorted_rats.append(manual_map[sid])
+            else:
+                print(f"⚠️ Subject {sid} not found in data")
+
+        # Add any rats not specified at the end
+        remaining = [r for r in per_rat_results.keys() if r not in sorted_rats]
+        sorted_rats.extend(remaining)
+        sorted_rats = sorted_rats[::-1]
+
+    else:
+        # Default behavior: sort by peak amplitude
+        rat_peak_scores = {}
+        rat_mean_scores = {}
+        
+        for rat, trace in per_rat_results.items():
+            df_rat = trace["baselined_epocs"]
+            mean_trace = df_rat.mean(axis=1)
+
+            if master_xlim is not None:
+                mean_trace = mean_trace[x_mask]
+
+            rat_peak_scores[rat] = mean_trace.max()
+            rat_mean_scores[rat] = mean_trace.mean()
+        
+        '''
+        sorted_rats = sorted(
+            rat_peak_scores.keys(),
+            key=lambda r: rat_peak_scores[r],
+            reverse=False
+        '''
+            
+        sorted_rats = sorted(
+            rat_mean_scores.keys(),
+            key=lambda r: rat_mean_scores[r],
+            reverse=False
+            
+        )
+
+    # Plot each rat in sorted order
+    y_offset = 0
+    yticks_trial, yticklabels_trial = [], []
+    yticks_rat, yticklabels_rat = [], []
+
+    for rat in sorted_rats:
+        df_rat = per_rat_results[rat]["baselined_epocs"]
+
+        # Sort trials within rat by peak amplitude (descending)
+        #peak_vals = df_rat.min(axis=0)     # negpeak   
+        peak_vals = df_rat.max(axis=0)   #peak
+        sorted_cols = peak_vals.sort_values(ascending=False).index
+        #df_sorted = df_rat[sorted_cols]                         ###### sort by max amplitude (when timing doesn't matter, e.g. noncont tests)
+        df_sorted = df_rat                             ###### keep original trial order (chronological)
+        
+
+        # Apply heatmap_xlim
+        if master_xlim is not None:
+            df_sorted = df_sorted.loc[x_mask, :]
+
+        # Gaussian smoothing
+        if x_smooth_sigma > 0:
+            df_sorted = df_sorted.apply(lambda col: gaussian_filter1d(col.values, sigma=x_smooth_sigma), axis=0)
+
+        n_trials = df_sorted.shape[1]
+        ts_plot = ts[x_mask] if master_xlim is not None else ts
+
+        # Plot trials block (flip vertically so largest trial peaks at top)
+        extent = [ts_plot[0], ts_plot[-1], y_offset, y_offset + n_trials]
+        
+        im = ax_left.imshow(
+            df_sorted.T[::-1],
+            aspect='auto',
+            extent=extent,
+            origin='lower',
+            #cmap='viridis',
+            cmap = custom_cmap,
+            vmin=-vlim2,
+            vmax=vlim2,
+            interpolation='nearest'
+        )
+        
+      
+        # ==========================================================
+        # LEFT Y-AXIS: 3 ticks, floor-rounded to nearest 5
+        # First label always starts at 5
+        # ==========================================================
+
+        # Evenly spaced trial numbers
+        trial_vals = np.linspace(1, n_trials, 3)
+
+        # Floor to nearest 5
+        trial_vals_floor5 = (5 * np.floor(trial_vals / 5)).astype(int)
+
+        # Force first label to be 5
+        trial_vals_floor5[0] = 5
+
+        # Remove duplicates just in case (rare edge case)
+        trial_vals_floor5 = np.unique(trial_vals_floor5)
+
+        # Convert trial numbers to y positions (account for vertical flip)
+        y_positions = y_offset + (n_trials - trial_vals_floor5)
+
+        yticks_trial.extend(y_positions)
+        yticklabels_trial.extend(trial_vals_floor5)
+
+        # Right axis: rat label at top of block
+        yticks_rat.append(y_offset + n_trials - 2)
+        yticklabels_rat.append(rat)
+
+        y_offset += n_trials + gap_between_rats
+
+    # Configure left y-axis
+    ax_left.set_ylabel('Trial # (per rat)')
+    ax_left.set_yticks(yticks_trial)
+    ax_left.set_yticklabels(yticklabels_trial)
+    ax_left.set_ylim(0, y_offset)
+    ax_left.set_xlabel('Time (s)')
+    ax_left.set_xlim(ts_plot[0], ts_plot[-1])
+    ax_left.set_title('All Trials Heatmap (per-animal trial count)')
+    ax_left.axvline(0, color='r', linewidth=1)
+    
+    '''
+    # Right y-axis for rat IDs
+    ax_right = ax_left.twinx()
+    ax_right.set_ylim(ax_left.get_ylim())
+    ax_right.set_yticks(yticks_rat)
+    ax_right.set_yticklabels(yticklabels_rat, rotation=0, ha='right')
+    ax_right.set_ylabel('Rat ID')
+    ax_right.tick_params(axis='y', pad=100)  # move labels 10 pts away from axis
+
+    # Colorbar on separate axis
+    fig_all_trials.colorbar(im, cax=ax_cbar, label='fluorescence (z-score)')
+    '''
+    
+    # Right y-axis: rat labels, **outside plot**
+    for i, rat_label in enumerate(yticklabels_rat):
+        y = yticks_rat[i]
+        ax_left.text(ts_plot[-1] + 0.5, y, rat_label, va='center', ha='left', fontsize=8)
+
+    # Adjust the x-limits to give space for labels
+    ax_left.set_xlim(ts_plot[0], ts_plot[-1] + 3)  # +3 adds padding for labels
+
+    # Colorbar: create a separate axis to the right
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    divider = make_axes_locatable(ax_left)
+    cax = divider.append_axes("right", size="5%", pad=0.5)  # pad=0.5 gives space after labels
+    fig_all_trials.colorbar(im, cax=cax, label='Fluorescence (z-score)')
+
+
+    plt.tight_layout()
+    plt.show()
+
+    # Save figure
+    heatmap_base = os.path.join(fig_output_path, f"{processed_phase}_{rat_str}_{eventname}_all_trials_heatmap")
+    safe_save_fig(fig_all_trials, heatmap_base)
+    
+    
+    # ------------------------------------------------------------
+    # FIGURE — WITHIN-ANIMAL HEATMAP (MATCHES ALL-TRIALS STYLE)
+    # ------------------------------------------------------------
+
+    # Use SAME vlim and sorted_rats from trial heatmap
+    fig_heatmap_within_rat = plt.figure(figsize=(2,0.75) if paperfigs else (11,6))
+    #fig_heatmap_within_rat = plt.figure(figsize=(1.7,0. 6375) if paperfigs else (11,6))    # smaller version for cues, nonconts etc. fig
+    gs2 = gridspec.GridSpec(1, 2, width_ratios=[20, 1], wspace=0.05)
+    ax_left2 = fig_heatmap_within_rat.add_subplot(gs2[0])
+    ax_cbar2 = fig_heatmap_within_rat.add_subplot(gs2[1])
+
+    if within_animal_epocs_mean is None or within_animal_epocs_mean.empty:
+        print("⚠️ No within-animal mean data available for heatmap.")
+    else:
+
+        epoc_ts = within_animal_epocs_mean["time"].to_numpy()
+
+        # Keep same x-limits logic
+        if master_xlim is not None:
+            x_mask2 = (epoc_ts >= master_xlim[0]) & (epoc_ts <= master_xlim[1])
+            epoc_ts_plot = epoc_ts[x_mask2]
+        else:
+            x_mask2 = slice(None)
+            epoc_ts_plot = epoc_ts
+
+        # Reorder rows to match sorted_rats from first heatmap
+        rat_labels = sorted_rats
+        heatmap_within_rat_data = (
+            within_animal_epocs_mean[rat_labels]
+            .to_numpy()
+            .T
+        )
+
+        heatmap_within_rat_data = heatmap_within_rat_data[:, x_mask2]
+
+        # Optional: same smoothing
+        x_smooth_sigma_within_rat = 0
+        if x_smooth_sigma_within_rat > 0:
+            heatmap_within_rat_data = np.array([
+                gaussian_filter1d(row, sigma=x_smooth_sigma_within_rat)
+                for row in heatmap_within_rat_data
+            ])
+
+        # Plot (NO flipping needed — one row per rat)
+        extent2 = [
+            epoc_ts_plot[0],
+            epoc_ts_plot[-1],
+            0,
+            heatmap_within_rat_data.shape[0]
+        ]
+        
+        '''
+        im2 = ax_left2.imshow(
+            heatmap_within_rat_data,
+            aspect='auto',
+            extent=extent2,
+            origin='lower',
+            #cmap='viridis',
+            cmap='seismic',
+            vmin=-vlim,   # ← SAME SCALE AS FIRST HEATMAP
+            vmax=vlim,
+            interpolation='nearest' 
+        )
+        '''
+        
+        im2 = ax_left2.imshow(
+            heatmap_within_rat_data,
+            aspect='auto',
+            extent=extent2,
+            origin='lower',
+            cmap=custom_cmap,
+            #cmap='viridis',
+            norm=norm,
+            interpolation='nearest'
+        )
+
+        # Match styling
+        ax_left2.axvline(0, color='r', linewidth=1)
+        ax_left2.set_xlabel('Time (s)')
+        ax_left2.set_xlim(epoc_ts_plot[0], epoc_ts_plot[-1])
+        ax_left2.set_xticks([-5, 0, 5, 10, epoc_ts_plot[-1]])
+        ax_left2.set_xticklabels([-5, 0, 5, 10, 15]) 
+        ax_left2.set_ylabel('Rat ID')
+        if not paperfigs:
+            ax_left2.set_title('Within-Animal Heatmap') 
+
+        # Y ticks centered per row
+        yticks = np.arange(len(rat_labels)) + 0.5
+        ax_left2.set_yticks(yticks)
+
+        if paperfigs:
+            ax_left2.set_yticklabels([])        # remove subject IDs
+            ax_left2.set_ylabel("Subjects")
+            ax_left2.tick_params(axis='y', length=0)  # remove tick marks
+        else:
+            ax_left2.set_yticklabels(rat_labels)
+
+        ax_left2.set_ylim(0, len(rat_labels))      
+        
+        cbar = fig_heatmap_within_rat.colorbar(im2,cax=ax_cbar2)
+        
+        
+        
+        # Paperfigs condition
+        if paperfigs:
+            # Remove default vertical label
+            cbar.ax.set_ylabel('')
+
+            # Add horizontal label above the colorbar
+            # Use axes coordinates (0-1), x=0.5 centers it horizontally
+            ax_cbar2.text(
+                0.5, 1.05,           # x, y in axes fraction coordinates
+                'z-score',           # label text
+                ha='center', va='bottom',
+                fontsize=8,
+                transform=ax_cbar2.transAxes
+            )
+
+            # Always update ticks
+            vmin, vmax = -vlim, vlim
+            vmin_tick = np.ceil(vmin * 2) / 2
+            vmax_tick = np.floor(vmax * 2) / 2
+            ticks = [t for t in (vmin_tick, 0, vmax_tick) if vmin <= t <= vmax]
+            cbar.set_ticks(ticks)
+            cbar.set_ticklabels([f"{t:.1f}" for t in ticks])
+
+            # Optional: move ticks below label
+            ax_cbar2.xaxis.set_ticks_position('top')
+        else:
+            # Normal vertical label
+            cbar.set_label('Fluorescence (z-score)', fontsize=8)
+
+        fig_heatmap_within_rat.tight_layout()
+
+    plt.show()
+
+    # Save figure
+    heatmap_within_rat_base = os.path.join(
+        fig_output_path,
+        f"{processed_phase}_{rat_str}_{eventname}_within_rat_heatmap"
+    )
+    safe_save_fig(fig_heatmap_within_rat, heatmap_within_rat_base)
+    
+    
+    # -------------------
+    # -------------------
+    # Tier 3: across-animal (CORRECTED)
+    # -------------------
+
+    # ---------------------------------
+    # Build per-animal (per-rat) summary
+    # ---------------------------------
+    per_animal_epoc_stats = []
+    for rat, stats_dict in per_rat_stats.items():
+        per_animal_epoc_stats.append({
+            "rat_id": rat,
+            "cue_mean": stats_dict["cue_stats"][0],
+            "approach_mean": stats_dict["approach_stats"][0],
+            "auc_pre_mean": stats_dict["auc_pre_stats"][0],
+            "auc_post_mean": stats_dict["auc_post_stats"][0],
+            "onset_mean": stats_dict["onset_stats"][0],
+            "slope_mean": stats_dict["slope_stats"][0],
+            "time_to_peak_mean": stats_dict["time_to_peak_stats"][0],
+            "onset_peak_amp_mean": stats_dict["onset_peak_amp_stats"][0],
+            "overall_peak_amp_mean": stats_dict["overall_peak_amp_stats"][0],
+            "overall_peak_time_mean": stats_dict["overall_peak_time_stats"][0],
+        })
+
+    per_animal_stats_df = pd.DataFrame(per_animal_epoc_stats)
+
+    n_animals = len(per_animal_stats_df)
+
+    # ---------------------------------
+    # Across-animal scalar stats
+    # ---------------------------------
+    cue_mean_animal = per_animal_stats_df["cue_mean"].mean()
+    if n_animals > 1:
+        cue_sem_animal  = per_animal_stats_df["cue_mean"].std(ddof=1) / np.sqrt(n_animals)
+    else:
+        cue_sem_animal = 0.0
+        
+    approach_mean_animal = per_animal_stats_df["approach_mean"].mean()
+    if n_animals > 1:
+        approach_sem_animal  = per_animal_stats_df["approach_mean"].std(ddof=1) / np.sqrt(n_animals)
+    else:
+        approach_sem_animal = 0.0
+        
+    auc_pre_mean_animal = per_animal_stats_df["auc_pre_mean"].mean()
+    
+    if n_animals > 1:
+        auc_pre_sem_animal  = per_animal_stats_df["auc_pre_mean"].std(ddof=1) / np.sqrt(n_animals)
+    else:
+        auc_pre_sem_animal = 0.0
+        
+    auc_post_mean_animal = per_animal_stats_df["auc_post_mean"].mean()
+    if n_animals > 1:
+        auc_post_sem_animal  = per_animal_stats_df["auc_post_mean"].std(ddof=1) / np.sqrt(n_animals)
+    else:
+        auc_post_sem_animal = 0.0
+        
+    if n_animals > 1:
+        onset_sem_animal = per_animal_stats_df["onset_mean"].std(ddof=1) / np.sqrt(n_animals)
+        slope_sem_animal = per_animal_stats_df["slope_mean"].std(ddof=1) / np.sqrt(n_animals)
+    else:
+        onset_sem_animal = 0.0
+        slope_sem_animal = 0.0
+
+    onset_mean_animal = per_animal_stats_df["onset_mean"].mean()
+    slope_mean_animal = per_animal_stats_df["slope_mean"].mean()
+    
+    time_to_peak_mean_animal = per_animal_stats_df["time_to_peak_mean"].mean()
+    onset_peak_amp_mean_animal = per_animal_stats_df["onset_peak_amp_mean"].mean()
+
+    if n_animals > 1:
+        time_to_peak_sem_animal = per_animal_stats_df["time_to_peak_mean"].std(ddof=1) / np.sqrt(n_animals)
+        onset_peak_amp_sem_animal = per_animal_stats_df["onset_peak_amp_mean"].std(ddof=1) / np.sqrt(n_animals)
+    else:
+        time_to_peak_sem_animal = 0.0
+        onset_peak_amp_sem_animal = 0.0
+        
+    overall_peak_amp_mean_animal = per_animal_stats_df["overall_peak_amp_mean"].mean()
+    overall_peak_time_mean_animal = per_animal_stats_df["overall_peak_time_mean"].mean()
+
+    if n_animals > 1:
+        overall_peak_amp_sem_animal = (
+            per_animal_stats_df["overall_peak_amp_mean"].std(ddof=1)
+            / np.sqrt(n_animals)
+        )
+        overall_peak_time_sem_animal = (
+            per_animal_stats_df["overall_peak_time_mean"].std(ddof=1)
+            / np.sqrt(n_animals)
+        )
+    else:
+        overall_peak_amp_sem_animal = 0.0
+        overall_peak_time_sem_animal = 0.0
+
+    # ---------------------------------
+    # Across-animal time-resolved stats
+    # ---------------------------------
+    all_means = np.vstack([trace["mean"] for trace in per_animal_traces])
+
+    mean_across_animal = np.nanmean(all_means, axis=0)
+    if n_animals > 1:
+        sem_across_animal = (
+            np.nanstd(all_means, axis=0, ddof=1)
+            / np.sqrt(n_animals)
+        )
+    else:
+        sem_across_animal = np.zeros_like(mean_across_animal)
+
+    across_animal_stats = pd.DataFrame({
+        "mean_epoc_stream": mean_across_animal,
+        "sem_epoc_stream":  sem_across_animal
+    })
+
+
+    across_animal_epocs = pd.DataFrame({
+        "time": ts,
+        "mean_trace": mean_across_animal
+    })
+
+
+    ########### onset and slope figure
+    
+    ########### Across-Animal Onset & Slope Figure
+    fig_across_animal_onset, ax = plt.subplots(
+        figsize=master_figsize if paperfigs else (6,4)
+    )
+
+    # Plot mean trace
+    ax.plot(ts, mean_across_animal, label="Mean Trace")
+
+    # SEM shading
+    ax.fill_between(
+        ts,
+        mean_across_animal - sem_across_animal,
+        mean_across_animal + sem_across_animal,
+        alpha=0.3, linewidth=0, edgecolor='none'
+    )
+
+    # Event vertical line
+    ax.axvline(0, color="red", linestyle="-", label="Event")
+
+    # Onset vertical line
+    if not np.isnan(onset_mean_animal):
+        ax.axvline(onset_mean_animal, linestyle="--", color="magenta", label="Mean Onset")
+
+        # Include small window around onset for accurate interpolation
+        mask = (ts >= onset_mean_animal - 0.01) & (ts <= onset_mean_animal + 4)
+        t_win = ts[mask]
+        y_win = mean_across_animal[mask]
+
+        # Interpolate y at exact onset
+        y0 = np.interp(onset_mean_animal, t_win, y_win)
+
+        # Peak-based cutoff for slope line
+        onset_peak_val = np.nanmax(y_win)
+        threshold = 0.6 * onset_peak_val
+        above_thresh_idx = np.where(y_win >= threshold)[0]
+
+        if len(above_thresh_idx) > 0:
+            t_fit = t_win[:above_thresh_idx[0]+1]
+            slope_line = slope_mean_animal * (t_fit - onset_mean_animal) + y0
+            ax.plot(t_fit, slope_line, color="green", label="Mean Slope")
+
+    ax.set_title("Across-Animal Onset & Rising Slope")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Signal (z-score)")
+    ax.set_xlim(-0.5, 2.5)
+    ax.legend()
+    plt.show()
+
+    
+    
+    #################################
+    
+    # ---------------------------------
+    # Across-animal summary table
+    # ---------------------------------
+    combined_event_dict_animal = {
+        "event name": eventname,
+        "rats included": "-".join(sorted(per_rat_results.keys())),
+        "animal count": n_animals,
+        "subset": subset,
+
+        "approach window (s)": str(compute_kwargs["approach_window"]),
+        "mean approach response": f"{approach_mean_animal:.3f}",
+        "SEM approach response": f"{approach_sem_animal:.3f}",
+
+        "post window (s)": str(compute_kwargs["cue_window"]),
+        "mean post response": f"{cue_mean_animal:.3f}",
+        "SEM post response": f"{cue_sem_animal:.3f}",
+
+        "pre-event AUC window (s)": str(compute_kwargs["auc_pre_window"]),
+        "mean pre-event AUC": f"{auc_pre_mean_animal:.3f}",
+        "SEM pre-event AUC": f"{auc_pre_sem_animal:.3f}",
+
+        "post-event AUC window (s)": str(compute_kwargs["auc_post_window"]),
+        "mean post-event AUC": f"{auc_post_mean_animal:.3f}",
+        "SEM post-event AUC": f"{auc_post_sem_animal:.3f}",
+        
+        "mean onset latency (s)": f"{onset_mean_animal:.3f}",
+        "SEM onset latency (s)": f"{onset_sem_animal:.3f}",
+        "mean rise slope": f"{slope_mean_animal:.3f}",
+        "SEM rise slope": f"{slope_sem_animal:.3f}",
+        
+        "mean time to peak (s)": f"{time_to_peak_mean_animal:.3f}",
+        "SEM time to peak (s)": f"{time_to_peak_sem_animal:.3f}",
+        "mean onset peak amplitude": f"{onset_peak_amp_mean_animal:.3f}",
+        "SEM onset peak amplitude": f"{onset_peak_amp_sem_animal:.3f}",
+        
+        "overall peak window (s)": str(compute_kwargs.get("overall_peak_window", (0,8))),
+        "mean overall peak amplitude": f"{overall_peak_amp_mean_animal:.3f}",
+        "SEM overall peak amplitude": f"{overall_peak_amp_sem_animal:.3f}",
+        "mean overall peak timestamp (s)": f"{overall_peak_time_mean_animal:.3f}",
+        "SEM overall peak timestamp (s)": f"{overall_peak_time_sem_animal:.3f}",
+    }
+
+    combined_events_info_animal = (
+        pd.DataFrame.from_dict(combined_event_dict_animal, orient="index")
+          .reset_index()
+    )
+    combined_events_info_animal.columns = ["combined perievent analysis", "value"]
+    combined_events_info_animal = combined_events_info_animal.astype(str)
+
+    # ---------------------------------
+    # Save across-animal outputs
+    # ---------------------------------
+    base_all_animal = os.path.join(
+        save_dir,
+        f"{processed_phase}_{rat_str}_{eventname}_across_rat"
+    )
+    
+    base_all_animal_fig = os.path.join(
+        fig_output_path,
+        f"{processed_phase}_{rat_str}_{eventname}_across_rat"
+    )
+
+
+    safe_save_table(across_animal_epocs, base_all_animal + "_epocs_bslnd")
+    safe_save_table(across_animal_stats, base_all_animal + "_stats")
+    safe_save_table(per_animal_stats_df, base_all_animal + "_PER_ANIMAL_summary_stats")
+    safe_save_table(combined_events_info_animal, base_all_animal + "_summary")
+    safe_save_txt(
+        combined_events_info_animal.to_string(index=False),
+        base_all_animal + "_summary.txt"
+    )
+    
+    safe_save_fig(
+        fig_across_all,
+        base_all_animal_fig
+    )
+    
+    safe_save_fig(fig_across_animal_onset,
+                  base_all_animal_fig + "_onset_slope")
+
+
+    print("Across-trial SEM (approach):", approach_sem_all)
+    print("Across-animal SEM (approach):", approach_sem_animal)
+
+    print("\n✅ Perievent pipeline complete")
+
+    fig_all= {
+        "trial": fig_trial_all,
+        "across": fig_across_all,
+        "within": fig_within_all
+    }
+    
+    # -------------------------------------------------------------------------------------------------
+    # -------------------------------------------------------------------------------------------------
+    
+    if paperfigs:
+        # ---------------------------
+        # Figure setup
+        # ---------------------------
+        '''
+        fig_stack = plt.figure(figsize=(1.4, 1.925))  # total height = top 1.4 + bottom 0.525 + some space
+        gs = gridspec.GridSpec(
+            2, 2,
+            height_ratios=[1.4, 0.525],
+            width_ratios=[20, 1],
+            hspace=0.15,   # more vertical space
+            wspace=0.05
+        )
+
+        '''
+        # smaller size figure below for cues, noncont, etc. but a
+        #scale = 0.85
+        #scale = 1.42857143
+        scale = 1
+        
+        
+        fig_stack = plt.figure(figsize=(1.4*scale, 1.925*scale))
+
+        '''
+        gs = fig_stack.add_gridspec(
+            2, 2,
+            height_ratios=[1.4, 0.525],
+            width_ratios=[20, 1],
+            hspace=0.15,
+            wspace=0.05
+        )
+        '''
+        
+        height_ratios = np.array([1.4, 0.525]) * scale
+        width_ratios = np.array([20, 1]) * scale
+
+        gs = fig_stack.add_gridspec(
+            2, 2,
+            height_ratios=height_ratios,
+            width_ratios=width_ratios,
+            hspace=0.15,
+            wspace=0.05
+        )
+
+        ax_trace = fig_stack.add_subplot(gs[0, 0])
+        ax_heat = fig_stack.add_subplot(gs[1, 0], sharex=ax_trace)
+        ax_cbar = fig_stack.add_subplot(gs[1, 1])
+
+        # ---------------------------
+        # Across-animal trace
+        # ---------------------------
+        dark_green = np.array([36,106,72])/255
+        ax_trace.plot(ts, mean_across_animal, color=dark_green, lw=1.5, label="Mean across subjects")
+        ax_trace.fill_between(
+            ts,
+            mean_across_animal - sem_across_animal,
+            mean_across_animal + sem_across_animal,
+            color=dark_green,
+            alpha=0.4,
+            linewidth=0,
+            label="SEM"
+        )
+        ax_trace.axvline(0, color="red", lw=1, zorder=0)
+        ax_trace.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
+
+
+        # Remove x-axis
+        ax_trace.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+        ax_trace.set_ylabel("Fluorescence (z-score)")
+
+        # Set y-limits and ticks
+        ax_trace.set_ylim(master_ylim)
+        ylim_span = master_ylim[1] - master_ylim[0]
+
+        if ylim_span <= 2.0:
+            # ticks every 0.5 but constrained to master_ylim
+            yticks = np.arange(master_ylim[0], master_ylim[1]+1e-6, 0.5)
+        else:
+            # ticks every 1.0 but constrained to master_ylim
+            yticks = np.arange(master_ylim[0], master_ylim[1]+1e-6, 1.0)
+
+        ax_trace.set_yticks(yticks)
+        
+        
+        ax_trace.spines['bottom'].set_visible(False)
+        
+        # ---------------------------
+        # Excel significance markers (dynamic vertical spacing)
+        # ---------------------------
+        if excel_file_path is not None:
+            try:
+                sig_excel = pd.read_excel(excel_file_path, sheet_name=None)
+                y_top = master_ylim[1]
+
+                # Count total rows of markers (group comparisons + baseline)
+                n_group_sheets = len([name for name in sig_excel.keys() if "vs" in name.lower()]) if plot_group_comparison else 0
+                n_baseline_cols = len(sig_excel["Significance From Baseline"].columns) if (plot_baseline_significance and "Significance From Baseline" in sig_excel) else 0
+                total_rows = max(n_group_sheets + n_baseline_cols, 1)
+
+                # 15% of axis for all markers, stack them evenly
+                total_marker_height = 0.15 * (master_ylim[1] - master_ylim[0])
+                spacing = total_marker_height / max(total_rows, 1)
+                height = y_top + (total_rows - 1 - i) * spacing  # topmost row highest                
+                
+                legend_handles = []
+                legend_labels = []
+
+                # GROUP COMPARISONS
+                if plot_group_comparison:
+                    comparison_sheets = [name for name in sig_excel.keys() if "vs" in name.lower()]
+                    n_sheets = len(comparison_sheets)
+                    # Define key RGB colors for gradient: purple -> red -> orange
+                    key_colors = np.array([
+                        [128, 0, 128],    # purple
+                        [255, 0, 0],      # red
+                        [255, 165, 0]     # orange
+                    ]) / 255  # normalize to 0-1
+
+                    # Create a colormap spanning these colors
+                    from matplotlib.colors import LinearSegmentedColormap
+                    gradient_cmap = LinearSegmentedColormap.from_list("purple_red_orange", key_colors, N=256)
+                    # Sample n_sheets colors evenly along the gradient
+                    #colors = [gradient_cmap(i / max(n_sheets-1, 1)) for i in range(n_sheets)]
+
+                    # 2️⃣ List all possible pairwise comparisons among 4 groups
+                    all_comparisons = [
+                        "Group 1 vs Group 2",
+                        "Group 1 vs Group 3",
+                        "Group 1 vs Group 4",
+                        "Group 2 vs Group 3",
+                        "Group 2 vs Group 4",
+                        "Group 3 vs Group 4"
+                    ]
+                    # 3️⃣ Sample colors evenly along the gradient
+                    n_total = len(all_comparisons)
+                    comparison_colors = {comp: gradient_cmap(i / (n_total - 1)) for i, comp in enumerate(all_comparisons)}
+
+                    for i, sheet_name in enumerate(comparison_sheets):
+                        sig_vals = sig_excel[sheet_name].iloc[:,0].to_numpy()
+                        if len(sig_vals) > 1:
+                            sig_times = np.linspace(epoc_ts.min(), epoc_ts.max(), len(sig_vals))
+                            interp_vals = np.interp(ts, sig_times, sig_vals)
+                            mask = interp_vals > 0.5
+                            height = y_top * (0.95 - i*spacing)  # scale dynamically
+
+                            sc = ax_trace.scatter(
+                                ts[mask],
+                                height*np.ones(np.sum(mask)),
+                                marker='o',
+                                color=comparison_colors.get(sheet_name, (0.5,0.5,0.5)),  # fallback gray if missing
+                                linewidths=0,
+                                edgecolors='none',
+                                s=7,
+                                label=sheet_name
+                            )
+
+                            legend_handles.append(sc)
+                            legend_labels.append(sheet_name)
+
+                # BASELINE SIGNIFICANCE
+                if plot_baseline_significance and "Significance From Baseline" in sig_excel:
+                    sig_base = sig_excel["Significance From Baseline"]
+                    cmap = plt.get_cmap("tab10")
+                    for j, col in enumerate(sig_base.columns):
+                        sig_vals = sig_base[col].to_numpy()
+                        if len(sig_vals) > 1:
+                            sig_times = np.linspace(epoc_ts.min(), epoc_ts.max(), len(sig_vals))
+                            interp_vals = np.interp(ts, sig_times, sig_vals)
+                            mask = interp_vals > 0.5
+                            baseline_offset = n_group_sheets
+                            height = y_top * (0.95 - (baseline_offset + j)*spacing)
+                            sc = ax_trace.scatter(
+                                ts[mask],
+                                height*np.ones(np.sum(mask)),
+                                marker='o',
+                                #color=cmap(j%10),
+                                color=dark_green,
+                                linewidths=0,
+                                edgecolors='none',
+                                s=7,
+                                label=f"{col} baseline"
+                            )
+                            #legend_handles.append(sc)
+                            #legend_labels.append(f"{col} baseline")               
+                
+                # Legend off to the side
+                # Create a "patch" representing SEM
+                sem_patch = Rectangle((0,0), 1, 1, facecolor=dark_green, alpha=0.4, edgecolor='none')
+                # Create a line representing the mean
+                mean_line = Line2D([0,1],[0,0], color=dark_green, lw=1.5)
+                # --- Baseline significance markers (collapsed into one) ---
+                baseline_handle = Line2D(
+                    [0], [0],
+                    marker='o',
+                    color='none',
+                    markerfacecolor=dark_green,
+                    markeredgecolor='none',  # remove black outline
+                    markeredgewidth=0,
+                    markersize=3,             # match scatter s=10 (~3pt)
+                    linestyle='None',
+                    label='Event-related transient'
+                )
+
+                # Use a tuple as a single legend entry
+  
+                all_handles = [(sem_patch, mean_line)] + [baseline_handle] + legend_handles
+                all_labels  = ["Mean across subjects"] + ["Event-related transient"] + legend_labels
+
+                
+                ax_trace.legend(
+                    handles=all_handles,
+                    labels=all_labels,
+                    handler_map={tuple: HandlerTuple(ndivide=None)},
+                    loc='center left',
+                    bbox_to_anchor=(1.35, 0.5),
+                    fontsize=7,
+                    frameon=True,
+                    markerscale=2
+                )
+                
+
+            except Exception as e:
+                print("⚠️ Could not overlay Excel significance:", e)
+
+        # ---------------------------
+        # Heatmap
+        # ---------------------------
+        im = ax_heat.imshow(
+            heatmap_within_rat_data,
+            aspect='auto',
+            extent=extent2,
+            origin='lower',
+            cmap=custom_cmap,
+            norm=norm,
+            interpolation='nearest'
+        )
+        ax_heat.axvline(0, color="red", lw=1)
+        ax_heat.set_xlabel("Time (s)")
+        ax_heat.set_xticks([-5,0,5,10,15])
+        ax_heat.set_yticks([])  # remove y ticks
+        ax_heat.set_ylabel("Subjects")
+
+        # ---------------------------
+        # Colorbar
+        # ---------------------------
+        cbar = fig_stack.colorbar(im, cax=ax_cbar)
+        cbar.ax.set_ylabel("")
+        
+        ax_cbar.set_position([
+            ax_heat.get_position().x1 + 0.05,  # small offset to the right
+            ax_heat.get_position().y0,
+            0.03,                              # width of colorbar
+            ax_heat.get_position().height
+        ])
+        
+        ax_cbar.text(
+            0.5, 1.12,
+            "z-score",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            transform=ax_cbar.transAxes
+        )
+        cbar.outline.set_visible(False)
+
+        fig_stack.tight_layout()
+        
+        safe_save_fig(
+            fig_stack,
+            os.path.join(fig_output_path, f"{processed_phase}_{rat_str}_{eventname}_stacked")
+        )
+        plt.show()        
+        
+    
+    # -------------------------------------------------------------------------------------------------
+    # -------------------------------------------------------------------------------------------------
+ 
+    return {
+        # --- Within-rat / per-rat ---
+        "per_rat": per_rat_results,
+        "per_rat_stats": per_rat_stats,  # cue/approach/AUC per rat
+        "per_epoc_stats_within_rat": per_epoc_stats_all,
+        "within_animal_epocs_mean": within_animal_epocs_mean,
+        "within_animal_epocs_sem": within_animal_epocs_sem,
+        "file_level_epoc_latency_count": file_summary_df,
+
+        # --- Across-trial ---
+        "combined_epocs_across_trial": combined_epocs_all,
+        "combined_epocs_baselined_across_trial": combined_baselined_all,
+        "combined_stats_across_trial": combined_stats_all,
+        "combined_events_info_across_trial": combined_events_info_trial,
+
+        # --- Across-animal ---
+        "across_animal_stats": across_animal_stats,   # time-resolved mean/SEM
+        "across_animal_epocs": across_animal_epocs,   # mean trace
+        "per_animal_stats": per_animal_stats_df,      # per-rat summary
+        "combined_events_info_across_animal": combined_events_info_animal,
+
+        # --- Figures ---
+        "fig_all": fig_all,
+
+        # --- Summary stats for convenience ---
+        "cue_stats_across_trial": (cue_mean_all, cue_sem_all),
+        "approach_stats_across_trial": (approach_mean_all, approach_sem_all),
+        "auc_pre_stats_across_trial": (auc_pre_mean_all, auc_pre_sem_all),
+        "auc_post_stats_across_trial": (auc_post_mean_all, auc_post_sem_all),
+
+        "cue_stats_across_animal": (cue_mean_animal, cue_sem_animal),
+        "approach_stats_across_animal": (approach_mean_animal, approach_sem_animal),
+        "auc_pre_stats_across_animal": (auc_pre_mean_animal, auc_pre_sem_animal),
+        "auc_post_stats_across_animal": (auc_post_mean_animal, auc_post_sem_animal),
+        
+        "onset_stats_across_trial": (onset_mean_all, onset_sem_all),
+        "slope_stats_across_trial": (slope_mean_all, slope_sem_all),
+        "onset_stats_across_animal": (onset_mean_animal, onset_sem_animal),
+        "slope_stats_across_animal": (slope_mean_animal, slope_sem_animal),
+        
+        "time_to_peak_stats_across_trial": (time_to_peak_mean_all, time_to_peak_sem_all),
+        "onset_peak_amp_stats_across_trial": (onset_peak_amp_mean_all, onset_peak_amp_sem_all),
+        "overall_peak_amp_stats_across_trial": (overall_peak_amp_mean_all, overall_peak_amp_sem_all),
+        "overall_peak_time_stats_across_trial": (overall_peak_time_mean_all, overall_peak_time_sem_all),
+
+        "time_to_peak_stats_across_animal": (time_to_peak_mean_animal, time_to_peak_sem_animal),
+        "onset_peak_amp_stats_across_animal": (onset_peak_amp_mean_animal, onset_peak_amp_sem_animal),
+        "overall_peak_amp_stats_across_animal": (overall_peak_amp_mean_animal, overall_peak_amp_sem_animal),
+        "overall_peak_time_stats_across_animal": (overall_peak_time_mean_animal, overall_peak_time_sem_animal),
+    }
+
+
+
+
+
+# concatenate multiple recording segments for stats and plotting ---------------------------------------------------------------------    
+
+def perievent_analysis(
+        *,
+        feather_folder=None,
+        file_pattern=None,
+        feather_files=None,
+        new_fs=20.0,
+        ts=None,
+        trange=None,
+        baseline_trange=None,
+        cue_window=None,
+        auc_pre_window=None,
+        auc_post_window=None,
+        approach_window=None,
+        plot_auc_region=False,
+        plot=True,
+        per_animal_traces=None,
+        per_animal_labels=None,
+        subset = None,
+        # --- NEW ONSET/SLOPE PARAMETERS ---
+        onset_search_window=(0, 3),
+        deriv_threshold=0.05,
+        deriv_smooth_window=7,
+        deriv_smooth_poly=6,
+        consecutive_points=2,
+        peak_fraction=0.5,
+        min_peak_amplitude=-1,
+        amp_onset_fraction=0.1,
+        plot_onset_detection = False,
+        plot_individual_trials = False,
+        master_xlim = None,
+        master_ylim = None,
+        overall_peak_window = (0,8),
+        rat_name = None,
+        excel_file_path = None,
+        plot_group_comparison=False,
+        plot_baseline_significance=False,
+        paperfigs = False,
+        master_figsize = (8, 8)
+):
+    """
+    Loads and concatenates GCaMP_465 epocs feather files, computes statistics,
+    plots peri-event responses, AND computes per-epoc baselined window stats.
+
+    Returns
+    -------
+    (
+        combined_epocs,                  # raw concatenated data
+        combined_epocs_baselined,        # baseline-subtracted data
+        epoc_stats,                      # mean/SEM/std for plotting
+        mean_epoc_stream,
+        std_epoc_stream,
+        sem_epoc_stream,
+        fig_across,
+        fig_within,
+        fig_trials,
+        None,
+        (cue_mean, cue_sem),
+        (auc_pre_mean, auc_pre_sem),
+        (auc_post_mean, auc_post_sem),
+        (approach_mean, approach_sem),
+        fig_onset,
+        (onset_mean, onset_sem),
+        (slope_mean, slope_sem),
+        (time_to_peak_mean, time_to_peak_sem),
+        (onset_peak_amp_mean, onset_peak_amp_sem),
+        (overall_peak_amp_mean, overall_peak_amp_sem),
+        (overall_peak_time_mean, overall_peak_time_sem),
+        per_epoc_stats_df               # per-column stats
+    )
+    """
+    import os, glob, re
+    from pathlib import Path
+    import pandas as pd
+    import numpy as np
+    from scipy import stats
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import gaussian_filter1d
+    from statsmodels.api import RLM, add_constant
+    from scipy.stats import linregress
+    from matplotlib.ticker import MultipleLocator
+
+    def configure_axis(ax):
+        ax.yaxis.set_major_locator(MultipleLocator(1))
+        ax.minorticks_off()
+
+    # ---------------------
+    # Gather files
+    # ---------------------
+    if feather_files is not None:
+        feather_files = list(feather_files)
+    else:
+        if feather_folder is None:
+            raise ValueError("Either 'feather_files' or 'feather_folder' must be provided")
+        if isinstance(feather_folder, str):
+            feather_folder = [feather_folder]
+        feather_files = []
+        for folder in feather_folder:
+            if file_pattern is None:
+                raise ValueError("'file_pattern' must be provided if feather_files is None")
+            feather_files.extend(glob.glob(os.path.join(folder, file_pattern)))
+
+    if not feather_files:
+        raise FileNotFoundError("No feather files found")
+
+    # ---------------------
+    # Load and concatenate
+    # ---------------------
+    epoc_dfs = []
+    epoc_rats = []
+    epoc_sources_per_df = []
+
+    for f in feather_files:
+        df = pd.read_feather(f)
+        
+        # ---------------------
+        # Optional subsetting
+        # ---------------------
+        if subset is not None:
+            n_cols = df.shape[1]
+
+            if isinstance(subset, int):
+                if subset > 0:
+                    # First N
+                    df = df.iloc[:, :min(subset, n_cols)]
+                elif subset < 0:
+                    # Last N
+                    df = df.iloc[:, max(0, n_cols + subset):]
+
+            elif isinstance(subset, (list, tuple)) and len(subset) == 2:
+                start, end = subset
+
+                # Convert 1-indexed inclusive to 0-indexed slice
+                start_idx = max(start - 1, 0)
+                end_idx   = min(end, n_cols)
+
+                if start_idx < end_idx:
+                    df = df.iloc[:, start_idx:end_idx]
+                else:
+                    df = df.iloc[:, 0:0]  # empty safely
+
+            else:
+                raise ValueError("subset must be int, negative int, or [start, end]")
+
+        if df.shape[1] == 0:
+            continue
+
+        fname = Path(f).stem
+        rat_match = re.search(r'ACW_coh5_IT_[fm]\d+', fname)
+        rat_id = rat_match.group(0) if rat_match else "unknown_rat"
+
+        df.columns = [f"{rat_id}_{col}" for col in df.columns]
+        epoc_dfs.append(df)
+        epoc_rats.append(rat_id)
+
+        # Track source file for each column
+        epoc_sources_per_df.append([Path(f).name] * df.shape[1])
+        
+    if len(epoc_dfs) == 0:
+        raise ValueError("No epocs remaining after subsetting/baseline filtering.")
+
+    combined_epocs = pd.concat(epoc_dfs, axis=1).reset_index(drop=True)
+
+    # Deduplicate columns if needed
+    def dedupe_columns(cols):
+        seen = {}
+        out = []
+        for c in cols:
+            if c not in seen:
+                seen[c] = 0
+                out.append(c)
+            else:
+                seen[c] += 1
+                out.append(f"{c}__{seen[c]}")
+        return out
+
+    combined_epocs.columns = dedupe_columns(combined_epocs.columns)
+
+    # ---------------------
+    # Baseline correction
+    # ---------------------
+    if baseline_trange is not None:
+        baseline_start_idx = int((baseline_trange[0] - trange[0]) * new_fs)
+        baseline_end_idx   = int((baseline_trange[1] - trange[0]) * new_fs)
+
+        filtered_epoc_dfs = []
+        filtered_sources = []
+
+        for df, src_list in zip(epoc_dfs, epoc_sources_per_df):
+
+            baseline_slice = df.iloc[baseline_start_idx:baseline_end_idx]
+            valid_fraction = baseline_slice.notna().sum(axis=0) / len(baseline_slice)
+            keep_cols = valid_fraction[valid_fraction >= 0.1].index
+
+            filtered_df = df[keep_cols]
+            filtered_epoc_dfs.append(filtered_df)
+
+            # Filter matching sources correctly
+            keep_mask = df.columns.isin(keep_cols)
+            filtered_sources.extend(np.array(src_list)[keep_mask].tolist())
+
+        if len(filtered_epoc_dfs) == 0 or all(df.shape[1] == 0 for df in filtered_epoc_dfs):
+            raise ValueError("No epocs remaining after baseline filtering.")
+
+        combined_epocs = pd.concat(filtered_epoc_dfs, axis=1).reset_index(drop=True)
+        combined_epocs.columns = dedupe_columns(combined_epocs.columns)
+
+        baseline_slice = combined_epocs.iloc[baseline_start_idx:baseline_end_idx]
+        baselines = baseline_slice.mean()
+        combined_epocs_baselined = combined_epocs.subtract(baselines, axis=1)
+        data_to_use = combined_epocs_baselined
+
+        epoc_sources = filtered_sources  # <- update the sources list
+    else:
+        combined_epocs_baselined = combined_epocs.copy()
+        data_to_use = combined_epocs_baselined
+
+
+    # After baseline correction
+    if trange is not None:
+        start_idx = max(int((trange[0] - trange[0]) * new_fs), 0)  # 0 offset
+        end_idx   = min(int((trange[1] - trange[0]) * new_fs), data_to_use.shape[0])
+        data_to_use = data_to_use.iloc[start_idx:end_idx]
+
+    # ---------------------
+    # Time vector
+    # ---------------------
+    epoc_ts = trange[0] + np.arange(len(data_to_use)) / new_fs
+
+    #epoc_ts = np.linspace(trange[0], trange[1], data_to_use.shape[0])
+    
+    ###################################
+
+    dt = epoc_ts[1] - epoc_ts[0]
+
+    # ============================================================
+    # 🔬 ONSET + SLOPE DETECTION
+    # ============================================================
+    
+    
+    from statsmodels.robust.robust_linear_model import RLM
+    from statsmodels.tools import add_constant
+    from scipy.signal import savgol_filter
+    import numpy as np
+
+    
+    
+    def detect_onset_and_slope(
+            y, epoc_ts, dt,
+            onset_search_window,
+            deriv_threshold,
+            deriv_smooth_window,
+            deriv_smooth_poly,
+            consecutive_points,
+            peak_fraction,
+            min_peak_amplitude,
+            amp_onset_fraction
+    ):
+        """
+        Detect onset, rising slope, time-to-peak, and peak amplitude
+        using derivative + amplitude logic with full numerical safeguards.
+
+        Returns
+        -------
+        onset_time : float
+        slope : float
+        time_to_peak : float
+        peak_val : float
+        """
+
+        import numpy as np
+        from scipy.signal import savgol_filter
+        from statsmodels.robust.robust_linear_model import RLM
+        from statsmodels.tools import add_constant
+
+        # -----------------------------
+        # Restrict to onset search window
+        # -----------------------------
+        mask = (epoc_ts >= onset_search_window[0]) & (epoc_ts <= onset_search_window[1])
+        if mask.sum() < 3:
+            return np.nan, np.nan, np.nan, np.nan
+
+        y_win = y[mask]
+        ts_win = epoc_ts[mask]
+
+        # -----------------------------
+        # Remove NaNs early
+        # -----------------------------
+        if np.all(np.isnan(y_win)):
+            return np.nan, np.nan, np.nan, np.nan
+
+        if np.any(np.isnan(y_win)):
+            return np.nan, np.nan, np.nan, np.nan
+
+
+        # -----------------------------
+        # Smooth signal for peak detection
+        # -----------------------------
+        from scipy.ndimage import gaussian_filter1d
+        y_smooth = gaussian_filter1d(y_win, sigma=2)
+
+        # -----------------------------
+        # Peak detection (on smoothed signal)
+        # -----------------------------
+        peak_idx = np.nanargmax(y_smooth)
+        onset_peak_val = y_smooth[peak_idx]
+        onset_peak_time = ts_win[peak_idx]
+        
+        
+        if onset_peak_val < min_peak_amplitude:
+            return np.nan, np.nan, np.nan, np.nan
+
+        # -----------------------------
+        # Validate Savitzky–Golay window
+        # -----------------------------
+        max_window = len(y_win)
+        if max_window % 2 == 0:
+            max_window -= 1  # must be odd
+
+        window_length = min(deriv_smooth_window, max_window)
+
+        if window_length <= deriv_smooth_poly:
+            return np.nan, np.nan, np.nan, np.nan
+
+        if window_length < 3:
+            return np.nan, np.nan, np.nan, np.nan
+
+        # -----------------------------
+        # Compute derivative safely
+        # -----------------------------
+        try:
+            dydt = savgol_filter(
+                y_win,
+                window_length=window_length,
+                polyorder=deriv_smooth_poly,
+                deriv=1,
+                delta=dt
+            )
+        except Exception:
+            return np.nan, np.nan, np.nan, np.nan
+
+        if np.all(np.isnan(dydt)):
+            return np.nan, np.nan, np.nan, np.nan
+
+        # -----------------------------
+        # Dynamic derivative threshold
+        # -----------------------------
+        max_dydt = np.nanmax(dydt)
+        dynamic_threshold = max(deriv_threshold, 0.1 * max_dydt)
+        above = dydt > dynamic_threshold
+
+        # -----------------------------
+        # Derivative-based onset
+        # -----------------------------
+        onset_idx_deriv = None
+        for i in range(len(above) - consecutive_points + 1):
+            if np.all(above[i:i + consecutive_points]):
+                onset_idx_deriv = i
+                break
+
+        # -----------------------------
+        # Amplitude-based onset
+        # -----------------------------
+        amp_threshold = amp_onset_fraction * onset_peak_val
+        onset_candidates_amp = np.where(y_win >= amp_threshold)[0]
+        onset_idx_amp = onset_candidates_amp[0] if len(onset_candidates_amp) > 0 else None
+
+        # -----------------------------
+        # Combine logic
+        # -----------------------------
+        if onset_idx_deriv is None and onset_idx_amp is None:
+            return np.nan, np.nan, np.nan, np.nan
+
+        if onset_idx_deriv is None:
+            onset_idx = onset_idx_amp
+        elif onset_idx_amp is None:
+            onset_idx = onset_idx_deriv
+        else:
+            onset_idx = min(onset_idx_deriv, onset_idx_amp)
+
+        onset_time = ts_win[onset_idx]
+
+        # -----------------------------
+        # Time-to-peak
+        # -----------------------------
+        time_to_peak = onset_peak_time - onset_time
+
+        if time_to_peak <= 0:
+            return onset_time, np.nan, np.nan, onset_peak_val
+
+        # -----------------------------
+        # Rising slope fit window
+        # -----------------------------
+        threshold_val = peak_fraction * onset_peak_val
+        above_thresh = np.where(y_win >= threshold_val)[0]
+        valid_end = above_thresh[above_thresh > onset_idx]
+
+        end_idx = valid_end[0] if len(valid_end) > 0 else peak_idx
+
+        if end_idx <= onset_idx:
+            return onset_time, np.nan, time_to_peak, onset_peak_val
+
+        x_fit = ts_win[onset_idx:end_idx + 1]
+        y_fit = y_win[onset_idx:end_idx + 1]
+
+        if len(x_fit) < 3:
+            return onset_time, np.nan, time_to_peak, onset_peak_val
+
+        # -----------------------------
+        # Robust linear fit
+        # -----------------------------
+        try:
+            X = add_constant(x_fit)
+            rlm_model = RLM(y_fit, X)
+            slope = rlm_model.fit().params[1]
+        except Exception:
+            slope = np.nan
+
+        return onset_time, slope, time_to_peak, onset_peak_val
+
+    onset_dict = {}
+    slope_dict = {}
+    time_to_peak_dict = {}
+    onset_peak_amp_dict = {}
+    
+    dt = epoc_ts[1] - epoc_ts[0]
+
+    for col in data_to_use.columns:
+        y = data_to_use[col].values
+        onset, slope, ttp, onset_peak_amp = detect_onset_and_slope(
+            y, epoc_ts, dt,
+            onset_search_window=onset_search_window,
+            deriv_threshold=deriv_threshold,
+            deriv_smooth_window=deriv_smooth_window,
+            deriv_smooth_poly=deriv_smooth_poly,
+            consecutive_points=consecutive_points,
+            peak_fraction=peak_fraction,
+            min_peak_amplitude=min_peak_amplitude,
+            amp_onset_fraction=amp_onset_fraction
+        )
+        onset_dict[col] = onset
+        slope_dict[col] = slope
+        time_to_peak_dict[col] = ttp
+        onset_peak_amp_dict[col] = onset_peak_amp
+
+
+    # ============================================================
+    # 🔬 OVERALL PEAK AMPLITUDE (within defined window)
+    # ============================================================
+    
+    overall_peak_amp_dict = {}
+    overall_peak_time_dict = {}
+
+    if overall_peak_window is not None:
+        w_start, w_end = overall_peak_window
+        win_mask = (epoc_ts >= w_start) & (epoc_ts <= w_end)
+
+        for col in data_to_use.columns:
+            y = data_to_use[col].values
+            y_win = y[win_mask]
+            ts_win = epoc_ts[win_mask]
+
+            if len(y_win) == 0 or np.all(np.isnan(y_win)):
+                overall_peak_amp_dict[col] = np.nan
+                overall_peak_time_dict[col] = np.nan
+                continue
+
+            peak_idx = np.nanargmax(y_win)
+            overall_peak_amp_dict[col] = y_win[peak_idx]
+            overall_peak_time_dict[col] = ts_win[peak_idx]
+    else:
+        for col in data_to_use.columns:
+            overall_peak_amp_dict[col] = np.nan
+            overall_peak_time_dict[col] = np.nan
+    
+    
+    # ---------------------
+    # Per-epoc stats (fixed for proper alignment)
+    # ---------------------
+    per_epoc_stats_df = pd.DataFrame(index=data_to_use.columns)
+    per_epoc_stats_df.index.name = "epoc_id"
+
+    # Map onset/slope
+    per_epoc_stats_df["response_latency_sec"] = [onset_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["rising_slope"] = [slope_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["time_to_peak_sec"] = [time_to_peak_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["onset_peak_amplitude"] = [onset_peak_amp_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["overall_peak_amp"] = [
+    overall_peak_amp_dict.get(epoc, np.nan)
+        for epoc in per_epoc_stats_df.index
+    ]
+
+    per_epoc_stats_df["overall_peak_amp_timestamp"] = [
+        overall_peak_time_dict.get(epoc, np.nan)
+        for epoc in per_epoc_stats_df.index
+    ]
+
+    # ---------------------
+    
+    # Per-rat mean + SEM
+    # ---------------------
+    latency_vals = per_epoc_stats_df["response_latency_sec"].values
+    slope_vals = per_epoc_stats_df["rising_slope"].values
+    time_to_peak_vals = per_epoc_stats_df["time_to_peak_sec"].values
+    onset_peak_amp_vals = per_epoc_stats_df["onset_peak_amplitude"].values
+    
+
+    onset_mean = np.nanmean(latency_vals)
+    onset_sem = stats.sem(latency_vals, nan_policy="omit")
+
+    slope_mean = np.nanmean(slope_vals)
+    slope_sem = stats.sem(slope_vals, nan_policy="omit")
+    
+    time_to_peak_mean = np.nanmean(time_to_peak_vals)
+    time_to_peak_sem = stats.sem(time_to_peak_vals, nan_policy="omit")
+
+    onset_peak_amp_mean = np.nanmean(onset_peak_amp_vals)
+    onset_peak_amp_sem = stats.sem(onset_peak_amp_vals, nan_policy="omit")
+
+    overall_peak_vals = per_epoc_stats_df["overall_peak_amp"].values
+    overall_peak_time_vals = per_epoc_stats_df["overall_peak_amp_timestamp"].values
+
+    overall_peak_amp_mean = np.nanmean(overall_peak_vals)
+    overall_peak_amp_sem  = stats.sem(overall_peak_vals, nan_policy="omit")
+
+    overall_peak_time_mean = np.nanmean(overall_peak_time_vals)
+    overall_peak_time_sem  = stats.sem(overall_peak_time_vals, nan_policy="omit")
+
+    per_rat_onset_stats = {
+        "latency_mean": onset_mean,
+        "latency_sem": onset_sem,
+        "slope_mean": slope_mean,
+        "slope_sem": slope_sem,
+        "time_to_peak_mean": time_to_peak_mean,
+        "time_to_peak_sem":  time_to_peak_sem,
+        "onset_peak_amp_mean": onset_peak_amp_mean,
+        "onset_peak_amp_sem": onset_peak_amp_sem,
+        "overall_peak_amp_mean": overall_peak_amp_mean,
+        "overall_peak_amp_sem": overall_peak_amp_sem,
+        "overall_peak_time_mean": overall_peak_time_mean,
+        "overall_peak_time_sem": overall_peak_time_sem,
+    }
+
+    # ============================================================
+    # OPTIONAL VISUALIZATION
+    # ============================================================
+    # ============================================================
+    # 📊 INDIVIDUAL TRIAL + PEAK TIMING PLOT (PER ANIMAL)
+    # ============================================================
+
+    fig_trials = None
+
+    
+    if plot_individual_trials:
+
+        fig_trials, ax1 = plt.subplots(figsize=master_figsize if paperfigs else (11,6))
+
+        if paperfigs:
+            configure_axis(ax1)
+            
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+
+        n_trials = len(data_to_use.columns)
+        cmap = cm.get_cmap("viridis")
+        norm = mcolors.Normalize(vmin=0, vmax=n_trials - 1)
+
+        peak_times = []
+        peak_vals  = []
+
+        for i, col in enumerate(data_to_use.columns):
+
+            trace = data_to_use[col].values
+
+            # Plot trace
+            ax1.plot(
+                epoc_ts,
+                trace,
+                color=cmap(norm(i)),
+                alpha=0.8,
+                linewidth=1
+            )
+
+            # Get peak time from your existing table
+            peak_time = overall_peak_time_dict[col]
+            peak_val  = overall_peak_amp_dict[col]
+
+            peak_times.append(peak_time)
+            peak_vals.append(peak_val)
+
+            # Plot peak marker
+            ax1.scatter(
+                peak_time,
+                peak_val,
+                color=cmap(norm(i)),
+                edgecolor="white",
+                s=80,
+                zorder=5
+            )
+
+        # Mean trace
+        mean_epoc_stream_plot = np.nanmean(data_to_use, axis=1)
+        ax1.plot(
+            epoc_ts,
+            mean_epoc_stream_plot,
+            color="red",
+            linewidth=3,
+            label="Mean"
+        )
+
+        ax1.axvline(0, color="red", linestyle="--", linewidth=1, zorder=0)
+
+        # Optional: annotate jitter (SD of peak times)
+        peak_sd = np.nanstd(peak_times)
+        ax1.text(
+            0.02, 0.95,
+            f"Peak Time SD = {peak_sd:.3f}s",
+            transform=ax1.transAxes,
+            verticalalignment="top"
+        )
+
+        title_name = rat_name if rat_name is not None else "Animal"
+        ax1.set_title(f"{title_name} - Individual Trials with Peaks")
+
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Signal")
+
+        plt.tight_layout()
+
+    fig_onset = None
+
+    if plot_onset_detection and per_animal_traces is not None and len(per_animal_traces) > 0:
+        with plt.ioff():  # prevent automatic display
+            fig_onset, ax = plt.subplots(figsize=(8,6))
+            for col in data_to_use.columns:
+                y = data_to_use[col].values
+                ax.plot(epoc_ts, y, alpha=0.3)
+
+                onset = onset_dict[col]
+                slope = slope_dict[col]
+
+                if not np.isnan(onset) and not np.isnan(slope):
+                    ax.axvline(onset, linestyle='--', alpha=0.5)
+                    ax.axvline(0, linestyle="-", color="red", label="event")
+
+                    y0 = np.interp(onset, epoc_ts, y)
+                    x_line = np.linspace(onset, onset + 1.0, 50)
+                    y_line = y0 + slope * (x_line - onset)
+                    ax.plot(x_line, y_line, linewidth=2)
+
+            ax.set_title("Response onset and slope detection")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Fluorescence (z-score)")
+            ax.set_xlim(-0.5,3)
+
+    ###################################
+    
+    
+    # ---------------------
+    # Mean / std / SEM
+    # ---------------------
+    n_trials = data_to_use.shape[1]
+    
+    mean_epoc_stream = np.nanmean(data_to_use, axis=1)
+    if n_trials > 1:
+        std_epoc_stream = np.nanstd(data_to_use, axis=1, ddof=1)
+        sem_epoc_stream = stats.sem(data_to_use, axis=1, nan_policy='omit')
+    else:
+        std_epoc_stream = np.zeros_like(mean_epoc_stream)
+        sem_epoc_stream = np.zeros_like(mean_epoc_stream)
+
+    # ---------------------
+    # Window-level stats
+    # ---------------------
+    def window_stats(window):
+        if window is None:
+            return np.nan, np.nan
+        start_idx = np.searchsorted(epoc_ts, window[0])
+        end_idx   = np.searchsorted(epoc_ts, window[1])
+        wdata = data_to_use.iloc[start_idx:end_idx]
+        if wdata.empty:
+            return np.nan, np.nan
+        mean_val = wdata.mean().mean()
+        sem_val  = stats.sem(wdata.mean(), nan_policy='omit')
+        return mean_val, sem_val
+
+    cue_mean, cue_sem = window_stats(cue_window)
+    approach_mean, approach_sem = window_stats(approach_window)
+
+    # ---------------------
+    # AUC
+    # ---------------------
+    def compute_auc(window):
+        if window is None:
+            return np.nan, np.nan
+        start_idx = np.searchsorted(epoc_ts, window[0])
+        end_idx   = np.searchsorted(epoc_ts, window[1])
+        auc_vals = []
+        for col in data_to_use.columns:
+            y = data_to_use[col].iloc[start_idx:end_idx].values
+            x = epoc_ts[start_idx:end_idx]
+            finite_mask = np.isfinite(y)
+            if finite_mask.sum() < 2:
+                continue
+            auc = np.trapz(y[finite_mask], x[finite_mask])
+            if np.isfinite(auc):
+                auc_vals.append(auc)
+        if len(auc_vals) == 0:
+            return np.nan, np.nan
+        auc_vals = np.array(auc_vals)
+        mean_auc = np.mean(auc_vals)
+        sem_auc  = stats.sem(auc_vals) if len(auc_vals) > 1 else np.nan
+        return mean_auc, sem_auc
+
+    auc_pre_mean, auc_pre_sem   = compute_auc(auc_pre_window)
+    auc_post_mean, auc_post_sem = compute_auc(auc_post_window)
+
+    # ---------------------
+    # Per-epoc stats
+    # ---------------------
+    def per_epoc_window_mean(window):
+        if window is None:
+            return {}
+        start_idx = np.searchsorted(epoc_ts, window[0])
+        end_idx   = np.searchsorted(epoc_ts, window[1])
+        return {col: data_to_use[col].iloc[start_idx:end_idx].mean() for col in data_to_use.columns}
+
+    def per_epoc_auc(window):
+        if window is None:
+            return {}
+        start_idx = np.searchsorted(epoc_ts, window[0])
+        end_idx   = np.searchsorted(epoc_ts, window[1])
+        out = {}
+        for col in data_to_use.columns:
+            y = data_to_use[col].iloc[start_idx:end_idx].values
+            x = epoc_ts[start_idx:end_idx]
+            if len(x) == len(y) and np.any(np.isfinite(y)):
+                out[col] = float(np.trapz(y, x))
+        return out
+
+    
+    # Map window means
+    cue_vals = per_epoc_window_mean(cue_window)
+    approach_vals = per_epoc_window_mean(approach_window)
+    auc_pre_vals = per_epoc_auc(auc_pre_window)
+    auc_post_vals = per_epoc_auc(auc_post_window)
+
+    per_epoc_stats_df["cue_mean"] = [cue_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["approach_mean"] = [approach_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["auc_pre"] = [auc_pre_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["auc_post"] = [auc_post_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+
+    # Add source file
+    per_epoc_stats_df["source_file"] = epoc_sources
+
+    # Reset index if you want epoc_id as a column
+    per_epoc_stats_df = per_epoc_stats_df.reset_index()
+    
+    # ---------------------
+    # Stats DataFrame (time-resolved)
+    # ---------------------
+    epoc_stats = pd.DataFrame({
+        "mean_epoc_stream": mean_epoc_stream,
+        "std_epoc_stream": std_epoc_stream,
+        "sem_epoc_stream": sem_epoc_stream
+    })
+
+    # ---------------------
+    # Plotting (optional)
+    # ---------------------
+    fig_trial = None
+    fig_across = None
+    fig_within = None
+
+    mean_across_animal = None
+    sem_across_animal  = None
+    
+    if paperfigs:
+        # use consistent color maps, line widths, alpha
+        mean_color = np.array([36, 106, 72]) / 255         # across-trial mean
+        sem_alpha = 0.4
+        cue_color = 'blue'
+        approach_color = 'magenta'
+        auc_pre_color = 'blue'
+        auc_post_color = 'magenta'
+        line_width_mean = 2
+        line_width_individual = 1.5
+    else:
+        # legacy or interactive defaults
+        mean_color = 'yellow'
+        sem_alpha = 0.3
+        line_width_mean = 2
+        line_width_individual = 1.5
+
+
+    if per_animal_traces is not None and len(per_animal_traces) > 0:
+        all_means = np.array([trace["mean"] for trace in per_animal_traces])
+        mean_across_animal = np.nanmean(all_means, axis=0)
+        sem_across_animal  = np.nanstd(all_means, axis=0, ddof=1) / np.sqrt(all_means.shape[0])
+
+    if plot:
+        import matplotlib.cm as cm
+
+        # ------------------------------------------------------------
+        # FIGURE 1 — ACROSS-TRIAL
+        # ------------------------------------------------------------
+        fig_trial, ax = plt.subplots(1, 1, figsize=master_figsize if paperfigs else (11,6))
+        ax.axvline(0, color='r', linewidth=1, zorder=0)
+        ax.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
+        
+        if paperfigs:
+            configure_axis(ax)
+
+        ax.plot(epoc_ts, mean_epoc_stream, color=mean_color, linewidth=line_width_mean, label='Mean response', zorder=11)
+        ax.fill_between(epoc_ts,
+                        mean_epoc_stream - sem_epoc_stream,
+                        mean_epoc_stream + sem_epoc_stream,
+                        color=mean_color, alpha=sem_alpha, linewidth=0,
+                        edgecolor='none', label='SEM', zorder=10)
+
+        # Y-limits
+        k = 8
+        y_min = np.nanmin(mean_epoc_stream - k * sem_epoc_stream)
+        y_max = np.nanmax(mean_epoc_stream + k * sem_epoc_stream)
+        ax.set_ylim(y_min, y_max)
+        top_bar = y_max * 0.95
+
+        # Cue and approach bars
+        if not paperfigs:
+            for window, color, label in zip([cue_window, approach_window],
+                                            ['yellow', 'magenta'],
+                                            ['cue', 'approach']):
+                if window is not None:
+                    start, end = window
+                    x = epoc_ts[(epoc_ts >= start) & (epoc_ts <= end)]
+                    if x.size:
+                        ax.fill_between(x, top_bar*0.98, top_bar, color=color, alpha=0.7)
+                        ax.text(np.mean(x), top_bar*1.01, label, color=color,
+                                ha='center', va='bottom', fontsize=8)
+
+        # AUC shading
+        if plot_auc_region:
+            def safe_fill(window, color):
+                start, end = window
+                i0 = np.searchsorted(epoc_ts, start)
+                i1 = np.searchsorted(epoc_ts, end)
+                if i0 >= i1:
+                    return
+                y = mean_epoc_stream[i0:i1]
+                if np.all(np.isnan(y)):
+                    return
+                y = pd.Series(y).interpolate(limit_direction='both').to_numpy()
+                ax.fill_between(epoc_ts[i0:i1], 0, y, color=color, alpha=0.5, linewidth=0, edgecolor='none')
+
+            if auc_pre_window is not None:
+                safe_fill(auc_pre_window, 'green')
+            if auc_post_window is not None:
+                safe_fill(auc_post_window, 'blue')
+
+        ax.set_title('Across-trial mean ± SEM')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Fluorescence (z-score)')
+        ax.set_xlim(master_xlim)
+        ax.set_ylim (master_ylim)
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False, markerscale=2)
+
+
+        # ------------------------------------------------------------
+        # FIGURE 2 — ACROSS-ANIMAL
+        # ------------------------------------------------------------
+        fig_across, ax = plt.subplots(1, 1, figsize=master_figsize if paperfigs else (11,6))
+        ax.axvline(0, color='r', linewidth=1, zorder=0)
+        ax.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
+
+        if paperfigs:
+            configure_axis(ax)
+            
+        if mean_across_animal is not None:
+            ax.plot(epoc_ts, mean_across_animal, color=mean_color, linewidth=line_width_mean, label='Mean across subjects')
+            ax.fill_between(epoc_ts,
+                            mean_across_animal - sem_across_animal,
+                            mean_across_animal + sem_across_animal,
+                            color=mean_color, alpha=sem_alpha, linewidth=0,
+                            edgecolor='none', label='SEM')
+        else:
+            ax.plot(epoc_ts, mean_epoc_stream, color='yellow', linewidth=3, label='Mean response')
+            ax.fill_between(epoc_ts,
+                            mean_epoc_stream - sem_epoc_stream,
+                            mean_epoc_stream + sem_epoc_stream,
+                            color='yellow', alpha=0.4, linewidth=0,
+                            edgecolor='none', label='SEM')
+
+            
+        # -----------------------------
+        # Optional: Overlay Excel significance markers
+        # -----------------------------
+        # ==========================================================
+        # OPTIONAL SIGNIFICANCE OVERLAY (Fully Generalized)
+        # ==========================================================
+        if excel_file_path is not None:
+            try:
+                sig_excel = pd.read_excel(excel_file_path, sheet_name=None)
+
+                y_top = master_ylim[1]
+                vertical_spacing = 0.05  # spacing between stacked marker rows
+
+                # --------------------------------------------------
+                # GROUP COMPARISONS (auto-detect sheets with "vs")
+                # --------------------------------------------------
+                if plot_group_comparison:
+
+                    comparison_sheets = [
+                        name for name in sig_excel.keys()
+                        if "vs" in name.lower()
+                    ]
+
+                    n_sheets = len(comparison_sheets)
+                    # Create a gradient from magenta to dark gray
+                    start_color = np.array([1.0, 0.0, 1.0])  # magenta RGB
+                    end_color = np.array([0.3, 0.3, 0.3])    # dark gray RGB
+                    colors = [
+                        start_color + (end_color - start_color) * (i / max(n_sheets - 1, 1))
+                        for i in range(n_sheets)
+                    ]
+                    colors = [tuple(c) for c in colors]  # convert to tuples for matplotlib
+
+                    for i, sheet_name in enumerate(comparison_sheets):
+
+                        sig_vals = sig_excel[sheet_name].iloc[:, 0].to_numpy()
+
+                        if len(sig_vals) > 1:
+
+                            sig_times = np.linspace(
+                                epoc_ts.min(),
+                                epoc_ts.max(),
+                                len(sig_vals)
+                            )
+
+                            interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
+                            mask = interp_vals > 0.5
+
+                            height = y_top * (0.98 - i * vertical_spacing)
+
+                            ax.scatter(
+                                epoc_ts[mask],
+                                height * np.ones(np.sum(mask)),
+                                marker='o',
+                                color=colors[i],
+                                linewidths=0,
+                                edgecolors='none',
+                                s=7 if paperfigs else 100,
+                                label=sheet_name
+                            )
+
+                # --------------------------------------------------
+                # BASELINE SIGNIFICANCE (auto-detect columns)
+                # --------------------------------------------------
+                if plot_baseline_significance and "Significance From Baseline" in sig_excel:
+
+                    sig_base = sig_excel["Significance From Baseline"]
+
+                    # Color cycle for unlimited groups
+                    cmap = plt.get_cmap("tab10")
+
+                    for j, col in enumerate(sig_base.columns):
+
+                        sig_vals = sig_base[col].to_numpy()
+
+                        if len(sig_vals) > 1:
+
+                            sig_times = np.linspace(
+                                epoc_ts.min(),
+                                epoc_ts.max(),
+                                len(sig_vals)
+                            )
+
+                            interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
+                            mask = interp_vals > 0.5
+
+                            # Stack below comparison markers
+                            baseline_offset = len(comparison_sheets) * vertical_spacing
+                            height = y_top * (0.98 - baseline_offset - j * vertical_spacing)
+
+                            ax.scatter(
+                                epoc_ts[mask],
+                                height * np.ones(np.sum(mask)),
+                                marker='o',
+                                color=cmap(j % 10),
+                                linewidths=0,
+                                edgecolors='none',
+                                s=7 if paperfigs else 100,
+                                label=f"{col} baseline"
+                            )
+
+                ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), markerscale=2)
+
+            except Exception as e:
+                print("⚠️ Could not overlay Excel significance:", e)
+                print("epoc_ts length:", len(epoc_ts))
+        
+        if not paperfigs:    
+            # Cue and approach bars
+            for window, color, label in zip([cue_window, approach_window],
+                                            ['yellow', 'magenta'],
+                                            ['cue', 'approach']):
+                if window is not None:
+                    start, end = window
+                    x = epoc_ts[(epoc_ts >= start) & (epoc_ts <= end)]
+                    if x.size:
+                        ax.fill_between(x, top_bar*0.98, top_bar, color=color, alpha=0.7)
+                        ax.text(np.mean(x), top_bar*1.01, label, color=color,
+                                ha='center', va='bottom', fontsize=8)
+
+        # AUC shading
+        # AUC shading
+        if plot_auc_region:
+
+            def safe_fill(window, color):
+                start, end = window
+                i0 = np.searchsorted(epoc_ts, start)
+                i1 = np.searchsorted(epoc_ts, end)
+                if i0 >= i1:
+                    return
+
+                # Use across-animal mean if available
+                if mean_across_animal is not None:
+                    y_source = mean_across_animal
+                else:
+                    y_source = mean_epoc_stream
+
+                y = y_source[i0:i1]
+
+                if np.all(np.isnan(y)):
+                    return
+
+                y = pd.Series(y).interpolate(limit_direction='both').to_numpy()
+                ax.fill_between(epoc_ts[i0:i1], 0, y, color=color, alpha=0.5, linewidth=0,
+                        edgecolor='none')
+
+            if auc_pre_window is not None:
+                safe_fill(auc_pre_window, 'green')
+            if auc_post_window is not None:
+                safe_fill(auc_post_window, 'blue')
+
+
+        ax.set_ylim(y_min, y_max)
+        ax.set_title('Across-animal mean ± SEM')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Fluorescence (z-score)')
+        ax.set_xlim(master_xlim)
+        ax.set_ylim(master_ylim)
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False, markerscale=2)
+
+
+        # ------------------------------------------------------------
+        # FIGURE 3 — WITHIN-ANIMAL
+        # ------------------------------------------------------------
+        fig_within = None
+        if per_animal_traces is not None and len(per_animal_traces) > 0:
+            fig_within, ax = plt.subplots(1, 1, figsize=master_figsize if paperfigs else (11,6))
+            ax.axvline(0, color='r', linewidth=1, zorder=0)
+            ax.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
+            
+            if paperfigs:
+                configure_axis(ax)
+            
+            # Plot per-animal traces
+       
+            cmap_name = "viridis"   # <- easily change this
+            cmap = cm.get_cmap(cmap_name)
+            colors = cmap(np.linspace(0.1, 0.9, len(per_animal_traces)))
+            
+            for trace, c in zip(per_animal_traces, colors):
+                mean = trace['mean']
+                sem  = trace['sem']
+                rat  = trace['rat']
+                ax.plot(epoc_ts, mean, color=c, linewidth=line_width_individual, alpha=0.9, label=rat)
+                ax.fill_between(epoc_ts, mean - sem, mean + sem, color=c, alpha=sem_alpha, linewidth=0,
+                edgecolor='none',)
+
+                
+            # -----------------------------
+            # Optional: Overlay Excel significance markers
+            # -----------------------------
+            # ==========================================================
+            # OPTIONAL SIGNIFICANCE OVERLAY (Fully Generalized)
+            # ==========================================================
+            if excel_file_path is not None:
+                try:
+                    sig_excel = pd.read_excel(excel_file_path, sheet_name=None)
+
+                    y_top = master_ylim[1]
+                    vertical_spacing = 0.05  # spacing between stacked marker rows
+
+                    # --------------------------------------------------
+                    # GROUP COMPARISONS (auto-detect sheets with "vs")
+                    # --------------------------------------------------
+                    if plot_group_comparison:
+
+                        comparison_sheets = [
+                            name for name in sig_excel.keys()
+                            if "vs" in name.lower()
+                        ]
+
+                        n_sheets = len(comparison_sheets)
+                        # Create a gradient from magenta to dark gray
+                        start_color = np.array([1.0, 0.0, 1.0])  # magenta RGB
+                        end_color = np.array([0.3, 0.3, 0.3])    # dark gray RGB
+                        colors = [
+                            start_color + (end_color - start_color) * (i / max(n_sheets - 1, 1))
+                            for i in range(n_sheets)
+                        ]
+                        colors = [tuple(c) for c in colors]  # convert to tuples for matplotlib
+
+                        for i, sheet_name in enumerate(comparison_sheets):
+
+                            sig_vals = sig_excel[sheet_name].iloc[:, 0].to_numpy()
+
+                            if len(sig_vals) > 1:
+
+                                sig_times = np.linspace(
+                                    epoc_ts.min(),
+                                    epoc_ts.max(),
+                                    len(sig_vals)
+                                )
+
+                                interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
+                                mask = interp_vals > 0.5
+
+                                height = y_top * (0.98 - i * vertical_spacing)
+
+                                ax.scatter(
+                                    epoc_ts[mask],
+                                    height * np.ones(np.sum(mask)),
+                                    marker='o',
+                                    color=colors[i],
+                                    linewidths=0,
+                                    edgecolors='none',
+                                    s=7 if paperfigs else 100,
+                                    label=sheet_name
+                                )
+
+                    # --------------------------------------------------
+                    # BASELINE SIGNIFICANCE (auto-detect columns)
+                    # --------------------------------------------------
+                    if plot_baseline_significance and "Significance From Baseline" in sig_excel:
+
+                        sig_base = sig_excel["Significance From Baseline"]
+
+                        # Color cycle for unlimited groups
+                        cmap = plt.get_cmap("tab10")
+
+                        for j, col in enumerate(sig_base.columns):
+
+                            sig_vals = sig_base[col].to_numpy()
+
+                            if len(sig_vals) > 1:
+
+                                sig_times = np.linspace(
+                                    epoc_ts.min(),
+                                    epoc_ts.max(),
+                                    len(sig_vals)
+                                )
+
+                                interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
+                                mask = interp_vals > 0.5
+
+                                # Stack below comparison markers
+                                baseline_offset = len(comparison_sheets) * vertical_spacing
+                                height = y_top * (0.98 - baseline_offset - j * vertical_spacing)
+
+                                ax.scatter(
+                                    epoc_ts[mask],
+                                    height * np.ones(np.sum(mask)),
+                                    marker='o',
+                                    color=cmap(j % 10),
+                                    linewidths=0,
+                                    edgecolors='none',
+                                    s=7 if paperfigs else 100,
+                                    label=f"{col} baseline"
+                                )
+
+                    ax.legend(loc='upper right', fontsize=10, markerscale=2)
+
+                except Exception as e:
+                    print("⚠️ Could not overlay Excel significance:", e)
+                    print("epoc_ts length:", len(epoc_ts))
+
+            # -----------------------------
+            if not paperfigs:
+                # Add cue/approach bars
+                # -----------------------------
+                top_bar = np.nanmax([trace["mean"] + trace["sem"] for trace in per_animal_traces])
+                for window, color, label in zip([cue_window, approach_window],
+                                                ['yellow', 'magenta'],
+                                                ['cue', 'approach']):
+                    if window is not None:
+                        start, end = window
+                        x = epoc_ts[(epoc_ts >= start) & (epoc_ts <= end)]
+                        if x.size:
+                            ax.fill_between(x, top_bar*0.98, top_bar, color=color, alpha=0.7, linewidth=0, edgecolor='none')
+                            ax.text(np.mean(x), top_bar*1.01, label, color=color,
+                                    ha='center', va='bottom', fontsize=8)
+
+            ax.set_title('Within-animal mean ± SEM')
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Fluorescence (z-score)')
+            ax.set_xlim(master_xlim)
+            ax.set_ylim(master_ylim)
+            ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False, markerscale=2)
+
+    return (
+        combined_epocs,
+        combined_epocs_baselined,
+        epoc_stats,
+        mean_epoc_stream,
+        std_epoc_stream,
+        sem_epoc_stream,
+        fig_trial,
+        fig_across,
+        fig_within,
+        fig_onset,
+        fig_trials,
+        (cue_mean, cue_sem),
+        (auc_pre_mean, auc_pre_sem),
+        (auc_post_mean, auc_post_sem),
+        (approach_mean, approach_sem),
+        (onset_mean, onset_sem),
+        (slope_mean, slope_sem),
+        (time_to_peak_mean, time_to_peak_sem),
+        (onset_peak_amp_mean, onset_peak_amp_sem),
+        (overall_peak_amp_mean, overall_peak_amp_sem),
+        (overall_peak_time_mean, overall_peak_time_sem),
+        per_epoc_stats_df
+    )
 
 
 
@@ -7279,2848 +10166,6 @@ def save_combined_perievent_results_012226(
         with open(info_fp_txt, 'w') as f:
             f.write(combined_events_info.to_string(index=False, col_space=25, justify='left'))
         print(f"Saved text info to: {info_fp_txt}")
-
-
-
-# concatenate partial multiple recording segments from single animals ---------------------------------------------------------------------    
-# 01.23.26, update to include individual epoc data in outputs for later mixed model analysis potentially
-# 02.02.26 udpate to show within animal means, across animal means as separate plots 
-# updating 021926 to add new output for event latency, count by file
-
-
-
-
-
-def run_perievent_pipeline(
-    matched_files,
-    save_dir,
-    processed_phase,
-    eventname,
-    subset=None,
-    *,
-    compute_kwargs,
-    overwrite=False,
-    save_within_rat=False,
-    master_xlim = None,
-    master_ylim = None,
-    excel_file_path = None,
-    plot_group_comparison=True,
-    plot_baseline_significance=True,
-    paperfigs = False,
-    paperfig_path = None,
-    master_figsize = (2,2),
-    plot_onset_detection=False,
-):
-    import os
-    import pandas as pd
-    import numpy as np
-    from collections import defaultdict
-    from pathlib import Path
-    import re
-    from scipy import stats
-    import matplotlib as mpl
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import MultipleLocator
-    from matplotlib.patches import Patch
-    from matplotlib.patches import Rectangle
-    from matplotlib.lines import Line2D
-    from matplotlib.legend_handler import HandlerTuple
-
-    #########################################################################################################
-
-    def configure_figure_style(paperfigs=False, master_figsize=(8,8)):
-    
-        if paperfigs:
-            plt.style.use("default")
-
-            plt.rcParams.update({
-                "figure.facecolor": "none",
-                "axes.facecolor": "none",
-                "axes.edgecolor": "black",
-                "axes.labelcolor": "black",
-                "text.color": "black",
-                "xtick.color": "black",
-                "ytick.color": "black",
-                "grid.color": "0.85",
-                "axes.spines.top": False,
-                "axes.spines.right": False,
-                "figure.figsize": master_figsize,
-                "savefig.facecolor": "none",
-                "font.size": 7,
-                "axes.titlesize": 8,
-                "axes.labelsize": 7,
-                "xtick.labelsize": 7,
-                "ytick.labelsize": 7,
-            })
-
-        else:
-            plt.style.use("dark_background")
-            
-    configure_figure_style(
-        paperfigs=paperfigs,
-        master_figsize=master_figsize
-    )
-    
-
-    def configure_axis(ax):
-        ax.yaxis.set_major_locator(MultipleLocator(1))
-        ax.minorticks_off()
-
-    def get_output_path(default_path, paperfigs, paperfig_path):
-
-        if paperfigs:
-            os.makedirs(paperfig_path, exist_ok=True)
-            return paperfig_path
-        else:
-            os.makedirs(default_path, exist_ok=True)
-            return default_path
-        
-    fig_output_path = get_output_path(
-        save_dir,
-        paperfigs,
-        paperfig_path
-    )
-    
-    #########################################################################################################
-    
-    # ---------------------------------
-    # Handle optional analysis window
-    # ---------------------------------
-
-    compute_kwargs_local = compute_kwargs.copy()
-
-    # -----------------------------
-    # Determine final time range
-    # -----------------------------
-    analysis_trange = compute_kwargs_local.pop("analysis_trange", None)
-
-    if analysis_trange is not None:
-        start, duration = analysis_trange
-    else:
-        start, duration = compute_kwargs_local.get("trange", [-10, 25])
-
-    # If trange is meant as [start, duration], compute end
-    end = start + duration
-
-    # Save final trange back
-    trange_to_use = [start, end]
-    compute_kwargs_local["trange"] = trange_to_use
-
-    fs = compute_kwargs_local.get("new_fs", 20.0)  # sampling frequency
-    n_samples = int(duration * fs)  # number of samples based on duration
-
-    ts = np.linspace(start, end, n_samples, endpoint=False)  # use endpoint=False for exact duration
-
-
-        
-    # ----------------------
-    # Helper: safe feather/csv save
-    # ----------------------
-    def safe_save(df, path):
-        if df is None:
-            return False
-        if os.path.exists(path) and not overwrite:
-            print(f"↪️  Reusing existing file: {os.path.basename(path)}")
-            return False
-        df = df.reset_index(drop=True)
-        df.columns = df.columns.astype(str)
-        df.to_feather(path)
-        print(f"💾 Saved: {os.path.basename(path)}")
-        return True
-
-    def safe_save_table(df, base_path):
-        """
-        Save a DataFrame safely to Feather and CSV, ensuring Feather-compatible types.
-        Converts all object columns to strings to avoid ArrowTypeError.
-        """
-        import os
-        if df is None:
-            return False
-
-        feather_path = base_path + ".feather"
-        csv_path     = base_path + ".csv"
-
-        # Reset index and ensure column names are strings
-        df = df.reset_index(drop=True)
-        df.columns = df.columns.astype(str)
-
-        # Convert any object columns to string to prevent ArrowTypeError
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].astype(str)
-
-        # Save Feather
-        if not os.path.exists(feather_path) or overwrite:
-            df.to_feather(feather_path)
-            print(f"💾 Saved: {os.path.basename(feather_path)}")
-        else:
-            print(f"↪️  Reusing existing file: {os.path.basename(feather_path)}")
-
-        # Save CSV
-        if not os.path.exists(csv_path) or overwrite:
-            df.to_csv(csv_path, index=False)
-            print(f"💾 Saved: {os.path.basename(csv_path)}")
-        else:
-            print(f"↪️  Reusing existing file: {os.path.basename(csv_path)}")
-
-        return True
-
-
-    def safe_save_txt(text, path):
-        if text is None:
-            return False
-        if os.path.exists(path) and not overwrite:
-            print(f"↪️  Reusing existing file: {os.path.basename(path)}")
-            return False
-        with open(path, "w") as f:
-            f.write(text)
-        print(f"💾 Saved: {os.path.basename(path)}")
-        return True
-
-    
-    def safe_save_fig(fig, path_base):
-        """
-        Saves figure as PNG, PDF, and SVG automatically.
-        `path_base` should NOT include extension.
-        Example: safe_save_fig(fig, "my_figure")
-        """
-
-        if fig is None:
-            return False
-
-        # --- Illustrator-friendly font settings ---
-        mpl.rcParams['pdf.fonttype'] = 42      # Keep text editable in PDF
-        mpl.rcParams['ps.fonttype'] = 42
-        mpl.rcParams['svg.fonttype'] = 'none'  # Keep text editable in SVG
-
-        saved_any = False
-
-        formats = {
-            "png": {"dpi": 600},
-            "pdf": {},
-            "svg": {}
-        }
-
-        for ext, kwargs in formats.items():
-            full_path = f"{path_base}.{ext}"
-
-            if os.path.exists(full_path) and not overwrite:
-                print(f"↪️  Reusing existing figure: {os.path.basename(full_path)}")
-                continue
-
-            fig.savefig(
-                full_path,
-                bbox_inches='tight',
-                transparent= True,
-                facecolor= None,
-                edgecolor="none",
-                **kwargs
-            )
-
-            print(f"🖼️  Saved: {os.path.basename(full_path)}")
-            saved_any = True
-
-        return saved_any
-
-
-    # ----------------------
-    # Parse rat from filename
-    # ----------------------
-    def parse_rat(filename):
-        fname = Path(filename).stem
-        rat_match = re.search(r'ACW_coh5_IT_[fm]\d+', fname)
-        return rat_match.group(0) if rat_match else "unknown_rat"
-
-    # ----------------------
-    # Group files by rat
-    # ----------------------
-    rat_files = defaultdict(list)
-    for f in matched_files:
-        rat_files[parse_rat(f)].append(f)
-
-    print(f"\n🐀 Detected {len(rat_files)} rat(s): {list(rat_files.keys())}")
-
-    # ----------------------
-    # Initialize storage
-    # ----------------------
-    per_rat_stats = {}
-    per_rat_results = {}
-    per_animal_traces = []
-    per_rat_epoc_tables = []
-
-    # ----------------------
-    # NEW OUTPUT: File-level summary table with first onset times and event count e.g. for correlation with drug_avail signals
-    # ----------------------
-    file_summary_rows = []
-
-    onset_pattern = re.compile(r"onset_([0-9.]+)s")
-
-    for rat in sorted(rat_files.keys()):
-        for f in sorted(rat_files[rat]):
-
-            df = pd.read_feather(f)
-
-            # Extract onset times from column headers
-            onset_times = []
-            for col in df.columns:
-                match = onset_pattern.search(str(col))
-                if match:
-                    onset_times.append(float(match.group(1)))
-
-            if len(onset_times) > 0:
-                first_event_onset_sec = min(onset_times)
-            else:
-                first_event_onset_sec = np.nan
-
-            n_events = len(onset_times)
-
-            file_summary_rows.append({
-                "rat_id": rat,
-                "matched_file": Path(f).name,
-                "first_event_onset_sec": first_event_onset_sec,
-                "n_events": n_events
-            })
-
-    file_summary_df = (
-        pd.DataFrame(file_summary_rows)
-        .sort_values(["rat_id", "matched_file"])
-        .reset_index(drop=True)
-    )
-
-    # Save file-level summary
-    file_summary_base = os.path.join(
-        save_dir,
-        f"{processed_phase}_{eventname}_file_level_summary"
-    )
-
-    safe_save_table(file_summary_df, file_summary_base)
-        
-    # -------------------
-    # Tier 1: per-rat processing
-    # -------------------
-    #compute_kwargs_local = compute_kwargs.copy()
-    #analysis_trange = compute_kwargs_local.pop("analysis_trange", None)
-
-    
-    for rat, files in rat_files.items():
-        (
-            combined_epocs,
-            combined_baselined,
-            combined_stats,
-            mean_stream,
-            std_stream,
-            sem_stream,
-            _fig_trial,
-            _fig_across,
-            _fig_within,
-            _fig_onset,
-            fig_trials,
-            (cue_mean, cue_sem),
-            (auc_pre_mean, auc_pre_sem),
-            (auc_post_mean, auc_post_sem),
-            (approach_mean, approach_sem),
-            (onset_mean, onset_sem),  #NEW
-            (slope_mean, slope_sem),  #NEW
-            (time_to_peak_mean, time_to_peak_sem),
-            (onset_peak_amp_mean, onset_peak_amp_sem),
-            (overall_peak_amp_mean, overall_peak_amp_sem),
-            (overall_peak_time_mean, overall_peak_time_sem),
-            per_epoc_stats_df
-        ) = chunks_concat_compute_plot(
-            feather_files=files,
-            subset=subset,
-            **compute_kwargs_local,
-            plot=False,
-            plot_onset_detection=False,
-            master_xlim = master_xlim,
-            master_ylim = master_ylim,
-            overall_peak_window = (0,8),
-            rat_name = rat,
-            excel_file_path = excel_file_path,
-            plot_group_comparison=plot_group_comparison,
-            plot_baseline_significance=plot_baseline_significance,
-            paperfigs = paperfigs,
-            master_figsize = master_figsize
-        )
-
-            
-        # Add rat metadata
-        per_epoc_stats_df["rat_id"] = rat
-        per_rat_epoc_tables.append(per_epoc_stats_df)
-
-        per_rat_results[rat] = {
-            "epocs": combined_epocs,
-            "baselined_epocs": combined_baselined,
-            "stats": combined_stats,
-            "per_epoc_stats": per_epoc_stats_df
-        }
-
-        per_rat_stats[rat] = {
-            "cue_stats": (cue_mean, cue_sem),
-            "approach_stats": (approach_mean, approach_sem),
-            "auc_pre_stats": (auc_pre_mean, auc_pre_sem),
-            "auc_post_stats": (auc_post_mean, auc_post_sem),
-
-            "onset_stats": (onset_mean, onset_sem),
-            "slope_stats": (slope_mean, slope_sem),
-            "time_to_peak_stats": (time_to_peak_mean, time_to_peak_sem),
-            "onset_peak_amp_stats": (onset_peak_amp_mean, onset_peak_amp_sem),
-            
-            "overall_peak_amp_stats": (overall_peak_amp_mean, overall_peak_amp_sem),
-            "overall_peak_time_stats": (overall_peak_time_mean, overall_peak_time_sem),
-        }
-
-        # Store per-animal traces
-        mean_trace = np.nanmean(combined_baselined.values, axis=1)
-
-        n_trials = combined_baselined.shape[1]
-
-        if n_trials > 1:
-            sem_trace = (
-                np.nanstd(combined_baselined.values, axis=1, ddof=1)
-                / np.sqrt(n_trials)
-            )
-        else:
-            # Single-epoc case (e.g. program_start) → no within-animal variability
-            sem_trace = np.zeros_like(mean_trace)
-
-        per_animal_traces.append({
-            "rat": rat,
-            "mean": mean_trace,
-            "sem": sem_trace
-        })
-
-
-        # Save per-rat files
-        rat_base = os.path.join(save_dir, f"{processed_phase}_{rat}_{eventname}")
-        rat_base_fig = os.path.join(fig_output_path, f"{processed_phase}_{rat}_{eventname}")
-        safe_save_table(combined_baselined, rat_base + "_epocs_bslnd")
-        safe_save_table(combined_stats, rat_base + "_stats")
-        safe_save_table(per_epoc_stats_df, rat_base + "_per_epoc_stats")
-       
-
-        # per-rat figures can optionally be saved here
-        if _fig_onset is not None:      
-            safe_save_fig(_fig_onset, rat_base_fig + "_onset_slope")     # temp to assure this is working
-            
-        if fig_trials is not None:
-            safe_save_fig(fig_trials, rat_base_fig + "_individual_trials")
-            
-        
-    # -----------------------
-    # Build within-animal averaged epocs DataFrames
-    # -----------------------
-    #rat_str = "-".join(sorted(per_rat_results.keys()))
-    rat_str = "_".join([r.split('_')[-1] for r in sorted(per_rat_results.keys())])
-    within_base = os.path.join(
-        save_dir,
-        f"{processed_phase}_{rat_str}_{eventname}_within_rat_epoc_bslnd"
-    )
-
-    # Mean trace per rat
-    within_animal_epocs_mean = pd.DataFrame(
-        {trace["rat"]: trace["mean"] for trace in per_animal_traces}
-    )
-    within_animal_epocs_mean.insert(0, "time", ts)
-
-    # SEM trace per rat
-    within_animal_epocs_sem = pd.DataFrame(
-        {trace["rat"]: trace["sem"] for trace in per_animal_traces}
-    )
-    within_animal_epocs_sem.insert(0, "time", ts)
-
-    safe_save_table(within_animal_epocs_mean, within_base + "_means")
-    safe_save_table(within_animal_epocs_sem, within_base + "_sem")
-
-    #########
-    import matplotlib.pyplot as plt
-    
-    for rat in per_rat_stats.keys():
-        trace_dict = next(t for t in per_animal_traces if t["rat"] == rat)
-        mean_trace = trace_dict["mean"]
-        sem_trace = trace_dict["sem"]
-
-        rat_stats = per_rat_stats[rat]
-        onset_mean = rat_stats["onset_stats"][0]
-        slope_mean = rat_stats["slope_stats"][0]
-
-        if plot_onset_detection and per_animal_traces is not None and len(per_animal_traces) > 0:
-            fig, ax = plt.subplots(figsize=master_figsize if paperfigs else (6,4))
-            ax.plot(ts, mean_trace, label="Mean Trace")
-            ax.fill_between(ts, mean_trace - sem_trace, mean_trace + sem_trace, alpha=0.3, linewidth=0,
-                        edgecolor='none')
-
-            # Event vertical line
-            ax.axvline(0, color="red", linestyle="-", label="Event")
-
-            # Onset vertical line
-            if not np.isnan(onset_mean):
-                ax.axvline(onset_mean, linestyle="--", color="magenta", label="Mean Onset")
-
-                # Slice window starting just before onset
-                mask = ts >= onset_mean
-                t_win = ts[mask]
-                y_win = mean_trace[mask]
-
-                # Interpolate y at exact onset
-                y0 = np.interp(onset_mean, ts, mean_trace)
-
-                # Peak-based cutoff
-                onset_peak_val = np.nanmax(y_win)
-                threshold = 0.6 * onset_peak_val
-                above_thresh_idx = np.where(y_win >= threshold)[0]
-
-                if len(above_thresh_idx) > 0:
-                    t_fit = t_win[:above_thresh_idx[0]+1]
-                    slope_line = slope_mean * (t_fit - onset_mean) + y0  # start at interpolated y
-                    ax.plot(t_fit, slope_line, color="green", label="Mean Slope")
-
-            ax.set_title(f"{rat} - Within-Rat Onset & Slope")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Signal (z-score)")
-            ax.set_xlim(-0.5, 2)
-            ax.legend()
-            plt.show()
-        
-        
-    #########
-    # -------------------
-    # Tier 2: across-trial
-    # -------------------
-    all_files = [f for files in rat_files.values() for f in files]
-    (
-        combined_epocs_all,
-        combined_baselined_all,
-        combined_stats_all,
-        mean_all,
-        std_all,
-        sem_all,
-        fig_trial_all,
-        fig_across_all,
-        fig_within_all,
-        fig_onset,
-        fig_trials,
-        (cue_mean_all, cue_sem_all),
-        (auc_pre_mean_all, auc_pre_sem_all),
-        (auc_post_mean_all, auc_post_sem_all),
-        (approach_mean_all, approach_sem_all),
-        (onset_mean_all, onset_sem_all),
-        (slope_mean_all, slope_sem_all),
-        (time_to_peak_mean_all, time_to_peak_sem_all),
-        (onset_peak_amp_mean_all, onset_peak_amp_sem_all),
-        (overall_peak_amp_mean_all, overall_peak_amp_sem_all),
-        (overall_peak_time_mean_all, overall_peak_time_sem_all),
-        per_epoc_stats_all
-    ) = chunks_concat_compute_plot(
-        feather_files=all_files,
-        subset=subset,
-        **compute_kwargs_local,
-        plot=True,
-        per_animal_traces=per_animal_traces,
-        plot_onset_detection=False,
-        plot_individual_trials = False,
-        master_xlim = master_xlim,
-        master_ylim = master_ylim,
-        overall_peak_window = (0,8),
-        excel_file_path = excel_file_path,
-        plot_group_comparison=plot_group_comparison,
-        plot_baseline_significance=plot_baseline_significance,
-        paperfigs = paperfigs,
-        master_figsize = master_figsize
-
-    )
-
-
-    per_epoc_stats_all = pd.concat(per_rat_epoc_tables, ignore_index=True)
-    #rat_str = "_".join(sorted(per_rat_results.keys()))
-    rat_str = "_".join([r.split('_')[-1] for r in sorted(per_rat_results.keys())])
-    
-    # ---------- Across-trial summary ----------
-    combined_event_dict_trial = {
-        "event name": eventname,
-        "rats included": rat_str,
-        "event count": combined_epocs_all.shape[1],
-        "subset": subset,
-        "approach window (s)": str(compute_kwargs["approach_window"]),
-        "mean approach response": f"{approach_mean_all:.3f}",
-        "SEM approach response": f"{approach_sem_all:.3f}",
-        "cue window (s)": str(compute_kwargs["cue_window"]),
-        "mean cue response": f"{cue_mean_all:.3f}",
-        "SEM cue response": f"{cue_sem_all:.3f}",
-        "pre-event AUC window (s)": str(compute_kwargs["auc_pre_window"]),
-        "mean pre-event AUC": f"{auc_pre_mean_all:.3f}",
-        "SEM pre-event AUC": f"{auc_pre_sem_all:.3f}",
-        "post-event AUC window (s)": str(compute_kwargs["auc_post_window"]),
-        "mean post-event AUC": f"{auc_post_mean_all:.3f}",
-        "SEM post-event AUC": f"{auc_post_sem_all:.3f}",
-        "mean onset latency (s)": f"{onset_mean_all:.3f}",
-        "SEM onset latency (s)": f"{onset_sem_all:.3f}",
-        "mean rise slope": f"{slope_mean_all:.3f}",
-        "SEM rise slope": f"{slope_sem_all:.3f}",
-        "mean time to peak (s)": f"{time_to_peak_mean_all:.3f}",
-        "SEM time to peak (s)": f"{time_to_peak_sem_all:.3f}",
-        "mean onset peak amplitude": f"{onset_peak_amp_mean_all:.3f}",
-        "SEM onset peak amplitude": f"{onset_peak_amp_sem_all:.3f}",
-        "overall peak window (s)": str(compute_kwargs.get("overall_peak_window", (0,8))),
-        "mean overall peak amplitude": f"{overall_peak_amp_mean_all:.3f}",
-        "SEM overall peak amplitude": f"{overall_peak_amp_sem_all:.3f}",
-        "mean overall peak timestamp (s)": f"{overall_peak_time_mean_all:.3f}",
-        "SEM overall peak timestamp (s)": f"{overall_peak_time_sem_all:.3f}",
-    }
-
-    combined_events_info_trial = (
-        pd.DataFrame.from_dict(combined_event_dict_trial, orient="index")
-          .reset_index()
-    )
-    combined_events_info_trial.columns = ["combined perievent analysis", "value"]
-
-    # Matched files
-    matched_file_rows = pd.DataFrame({
-        "combined perievent analysis": ["matched file"] * len(all_files),
-        "value": [Path(f).name for f in all_files]
-    })
-    combined_events_info_trial = pd.concat([matched_file_rows, combined_events_info_trial], ignore_index=True).astype(str)
-
-    # Save across-trial files
-    base_all_trial = os.path.join(save_dir, f"{processed_phase}_{rat_str}_{eventname}_across_trial")
-    base_all_trial_fig = os.path.join(fig_output_path, f"{processed_phase}_{rat_str}_{eventname}_across_trial")
-
-    safe_save_table(combined_baselined_all, base_all_trial + "_epocs_bslnd")
-    safe_save_table(combined_stats_all, base_all_trial + "_stats")
-    safe_save_table(per_epoc_stats_all, base_all_trial + "_PER_EPOC_summary_stats")
-    safe_save_table(combined_events_info_trial, base_all_trial + "_summary")
-    safe_save_txt(combined_events_info_trial.to_string(index=False), base_all_trial + "_summary.txt")
-    
-    safe_save_fig(fig_trial_all, base_all_trial_fig + "_across_trials")
-    safe_save_fig(fig_within_all, base_all_trial_fig + "_within_rats")
-
-    from matplotlib import gridspec
-    from scipy.ndimage import gaussian_filter1d
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import os
-
-    # ------------------------------------------------------------
-    # FIGURE — Heatmap of ALL TRIALS (per-rat trial y-axis, right-aligned rat IDs)
-    # ------------------------------------------------------------
-    
-    
-    x_smooth_sigma = 2
-    gap_between_rats = 10
-    y_offset = 0
-
-    yticks_trial = []
-    yticklabels_trial = []
-    yticks_rat = []
-    yticklabels_rat = []
-
-    # Stack traces to compute color scale
-    within_means = np.vstack([trace["mean"] for trace in per_animal_traces])
-    if master_xlim is not None:
-        x_mask = (ts >= master_xlim[0]) & (ts <= master_xlim[1])
-        ts_plot = ts[x_mask]
-        within_means = within_means[:, x_mask]
-    else:
-        ts_plot = ts
-
-    vlim2 = np.nanmax(np.abs(within_means))
-    vlim = np.nanpercentile(np.abs(within_means), 98)
-    
-    ##############
-    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
-
-    # --- Custom diverging colormap ---
-    deep_green = np.array([36, 106, 72]) / 255
-    green = np.array([54, 158, 90]) / 255
-    purple = np.array([60, 30, 90]) / 255
-    white = np.array([1, 1, 1])
-    deep_redpurple = np.array([40, 15, 45]) / 255
-
-    custom_cmap = LinearSegmentedColormap.from_list(
-        "GreenPurple",
-        [deep_redpurple, purple, white, green, deep_green],
-        N=256
-    )
-
-    # Proper zero-centered normalization
-    norm = TwoSlopeNorm(vmin=-vlim, vcenter=0, vmax=vlim)
-    ##############
-    
-    
-
-    # Create figure with GridSpec: heatmap (left), colorbar (right)
-    fig_all_trials = plt.figure(figsize=(2,0.75) if paperfigs else (11,6))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[20, 1], wspace=0.05)
-    ax_left = fig_all_trials.add_subplot(gs[0])
-    ax_cbar = fig_all_trials.add_subplot(gs[1])
-
-
-    '''
-    # Compute a representative peak per rat using the mean across trials
-    rat_peak_scores = {}
-    for rat, trace in per_rat_results.items():
-        df_rat = trace["baselined_epocs"]
-        mean_trace = df_rat.mean(axis=1)  # mean across trials (row-wise)
-        if master_xlim is not None:
-            mean_trace = mean_trace[x_mask]  # apply x-limits if needed
-        rat_peak_scores[rat] = mean_trace.max()  # use max of the mean trace
-
-    # Sort rats by this representative peak (descending)
-    sorted_rats = sorted(rat_peak_scores.keys(), key=lambda r: rat_peak_scores[r], reverse=False)
-    '''
-    
-    # ------------------------------------------------------------
-    # Determine rat order
-    # ------------------------------------------------------------
-
-    subject_order = ["m4","f5","m8","f2","m3","m9","m5"]
-    #subject_order = None
-    
-    if subject_order is not None:
-
-        # Extract short IDs from rat names
-        rat_short = {rat: rat.split("_")[-1] for rat in per_rat_results.keys()}
-
-        # Map manual order to full rat names
-        manual_map = {v: k for k, v in rat_short.items()}
-
-        sorted_rats = []
-        for sid in subject_order:
-            if sid in manual_map:
-                sorted_rats.append(manual_map[sid])
-            else:
-                print(f"⚠️ Subject {sid} not found in data")
-
-        # Add any rats not specified at the end
-        remaining = [r for r in per_rat_results.keys() if r not in sorted_rats]
-        sorted_rats.extend(remaining)
-        sorted_rats = sorted_rats[::-1]
-
-    else:
-        # Default behavior: sort by peak amplitude
-        rat_peak_scores = {}
-        rat_mean_scores = {}
-        
-        for rat, trace in per_rat_results.items():
-            df_rat = trace["baselined_epocs"]
-            mean_trace = df_rat.mean(axis=1)
-
-            if master_xlim is not None:
-                mean_trace = mean_trace[x_mask]
-
-            rat_peak_scores[rat] = mean_trace.max()
-            rat_mean_scores[rat] = mean_trace.mean()
-        
-        '''
-        sorted_rats = sorted(
-            rat_peak_scores.keys(),
-            key=lambda r: rat_peak_scores[r],
-            reverse=False
-        '''
-            
-        sorted_rats = sorted(
-            rat_mean_scores.keys(),
-            key=lambda r: rat_mean_scores[r],
-            reverse=False
-            
-        )
-
-    # Plot each rat in sorted order
-    y_offset = 0
-    yticks_trial, yticklabels_trial = [], []
-    yticks_rat, yticklabels_rat = [], []
-
-    for rat in sorted_rats:
-        df_rat = per_rat_results[rat]["baselined_epocs"]
-
-        # Sort trials within rat by peak amplitude (descending)
-        #peak_vals = df_rat.min(axis=0)     # negpeak   
-        peak_vals = df_rat.max(axis=0)   #peak
-        sorted_cols = peak_vals.sort_values(ascending=False).index
-        #df_sorted = df_rat[sorted_cols]                         ###### sort by max amplitude (when timing doesn't matter, e.g. noncont tests)
-        df_sorted = df_rat                             ###### keep original trial order (chronological)
-        
-
-        # Apply heatmap_xlim
-        if master_xlim is not None:
-            df_sorted = df_sorted.loc[x_mask, :]
-
-        # Gaussian smoothing
-        if x_smooth_sigma > 0:
-            df_sorted = df_sorted.apply(lambda col: gaussian_filter1d(col.values, sigma=x_smooth_sigma), axis=0)
-
-        n_trials = df_sorted.shape[1]
-        ts_plot = ts[x_mask] if master_xlim is not None else ts
-
-        # Plot trials block (flip vertically so largest trial peaks at top)
-        extent = [ts_plot[0], ts_plot[-1], y_offset, y_offset + n_trials]
-        
-        im = ax_left.imshow(
-            df_sorted.T[::-1],
-            aspect='auto',
-            extent=extent,
-            origin='lower',
-            #cmap='viridis',
-            cmap = custom_cmap,
-            vmin=-vlim2,
-            vmax=vlim2,
-            interpolation='nearest'
-        )
-        
-      
-        # ==========================================================
-        # LEFT Y-AXIS: 3 ticks, floor-rounded to nearest 5
-        # First label always starts at 5
-        # ==========================================================
-
-        # Evenly spaced trial numbers
-        trial_vals = np.linspace(1, n_trials, 3)
-
-        # Floor to nearest 5
-        trial_vals_floor5 = (5 * np.floor(trial_vals / 5)).astype(int)
-
-        # Force first label to be 5
-        trial_vals_floor5[0] = 5
-
-        # Remove duplicates just in case (rare edge case)
-        trial_vals_floor5 = np.unique(trial_vals_floor5)
-
-        # Convert trial numbers to y positions (account for vertical flip)
-        y_positions = y_offset + (n_trials - trial_vals_floor5)
-
-        yticks_trial.extend(y_positions)
-        yticklabels_trial.extend(trial_vals_floor5)
-
-        # Right axis: rat label at top of block
-        yticks_rat.append(y_offset + n_trials - 2)
-        yticklabels_rat.append(rat)
-
-        y_offset += n_trials + gap_between_rats
-
-    # Configure left y-axis
-    ax_left.set_ylabel('Trial # (per rat)')
-    ax_left.set_yticks(yticks_trial)
-    ax_left.set_yticklabels(yticklabels_trial)
-    ax_left.set_ylim(0, y_offset)
-    ax_left.set_xlabel('Time (s)')
-    ax_left.set_xlim(ts_plot[0], ts_plot[-1])
-    ax_left.set_title('All Trials Heatmap (per-animal trial count)')
-    ax_left.axvline(0, color='r', linewidth=1)
-    
-    '''
-    # Right y-axis for rat IDs
-    ax_right = ax_left.twinx()
-    ax_right.set_ylim(ax_left.get_ylim())
-    ax_right.set_yticks(yticks_rat)
-    ax_right.set_yticklabels(yticklabels_rat, rotation=0, ha='right')
-    ax_right.set_ylabel('Rat ID')
-    ax_right.tick_params(axis='y', pad=100)  # move labels 10 pts away from axis
-
-    # Colorbar on separate axis
-    fig_all_trials.colorbar(im, cax=ax_cbar, label='fluorescence (z-score)')
-    '''
-    
-    # Right y-axis: rat labels, **outside plot**
-    for i, rat_label in enumerate(yticklabels_rat):
-        y = yticks_rat[i]
-        ax_left.text(ts_plot[-1] + 0.5, y, rat_label, va='center', ha='left', fontsize=8)
-
-    # Adjust the x-limits to give space for labels
-    ax_left.set_xlim(ts_plot[0], ts_plot[-1] + 3)  # +3 adds padding for labels
-
-    # Colorbar: create a separate axis to the right
-    from mpl_toolkits.axes_grid1 import make_axes_locatable
-    divider = make_axes_locatable(ax_left)
-    cax = divider.append_axes("right", size="5%", pad=0.5)  # pad=0.5 gives space after labels
-    fig_all_trials.colorbar(im, cax=cax, label='Fluorescence (z-score)')
-
-
-    plt.tight_layout()
-    plt.show()
-
-    # Save figure
-    heatmap_base = os.path.join(fig_output_path, f"{processed_phase}_{rat_str}_{eventname}_all_trials_heatmap")
-    safe_save_fig(fig_all_trials, heatmap_base)
-    
-    
-    # ------------------------------------------------------------
-    # FIGURE — WITHIN-ANIMAL HEATMAP (MATCHES ALL-TRIALS STYLE)
-    # ------------------------------------------------------------
-
-    # Use SAME vlim and sorted_rats from trial heatmap
-    fig_heatmap_within_rat = plt.figure(figsize=(2,0.75) if paperfigs else (11,6))
-    #fig_heatmap_within_rat = plt.figure(figsize=(1.7,0. 6375) if paperfigs else (11,6))    # smaller version for cues, nonconts etc. fig
-    gs2 = gridspec.GridSpec(1, 2, width_ratios=[20, 1], wspace=0.05)
-    ax_left2 = fig_heatmap_within_rat.add_subplot(gs2[0])
-    ax_cbar2 = fig_heatmap_within_rat.add_subplot(gs2[1])
-
-    if within_animal_epocs_mean is None or within_animal_epocs_mean.empty:
-        print("⚠️ No within-animal mean data available for heatmap.")
-    else:
-
-        epoc_ts = within_animal_epocs_mean["time"].to_numpy()
-
-        # Keep same x-limits logic
-        if master_xlim is not None:
-            x_mask2 = (epoc_ts >= master_xlim[0]) & (epoc_ts <= master_xlim[1])
-            epoc_ts_plot = epoc_ts[x_mask2]
-        else:
-            x_mask2 = slice(None)
-            epoc_ts_plot = epoc_ts
-
-        # Reorder rows to match sorted_rats from first heatmap
-        rat_labels = sorted_rats
-        heatmap_within_rat_data = (
-            within_animal_epocs_mean[rat_labels]
-            .to_numpy()
-            .T
-        )
-
-        heatmap_within_rat_data = heatmap_within_rat_data[:, x_mask2]
-
-        # Optional: same smoothing
-        x_smooth_sigma_within_rat = 0
-        if x_smooth_sigma_within_rat > 0:
-            heatmap_within_rat_data = np.array([
-                gaussian_filter1d(row, sigma=x_smooth_sigma_within_rat)
-                for row in heatmap_within_rat_data
-            ])
-
-        # Plot (NO flipping needed — one row per rat)
-        extent2 = [
-            epoc_ts_plot[0],
-            epoc_ts_plot[-1],
-            0,
-            heatmap_within_rat_data.shape[0]
-        ]
-        
-        '''
-        im2 = ax_left2.imshow(
-            heatmap_within_rat_data,
-            aspect='auto',
-            extent=extent2,
-            origin='lower',
-            #cmap='viridis',
-            cmap='seismic',
-            vmin=-vlim,   # ← SAME SCALE AS FIRST HEATMAP
-            vmax=vlim,
-            interpolation='nearest' 
-        )
-        '''
-        
-        im2 = ax_left2.imshow(
-            heatmap_within_rat_data,
-            aspect='auto',
-            extent=extent2,
-            origin='lower',
-            cmap=custom_cmap,
-            #cmap='viridis',
-            norm=norm,
-            interpolation='nearest'
-        )
-
-        # Match styling
-        ax_left2.axvline(0, color='r', linewidth=1)
-        ax_left2.set_xlabel('Time (s)')
-        ax_left2.set_xlim(epoc_ts_plot[0], epoc_ts_plot[-1])
-        ax_left2.set_xticks([-5, 0, 5, 10, epoc_ts_plot[-1]])
-        ax_left2.set_xticklabels([-5, 0, 5, 10, 15]) 
-        ax_left2.set_ylabel('Rat ID')
-        if not paperfigs:
-            ax_left2.set_title('Within-Animal Heatmap') 
-
-        # Y ticks centered per row
-        yticks = np.arange(len(rat_labels)) + 0.5
-        ax_left2.set_yticks(yticks)
-
-        if paperfigs:
-            ax_left2.set_yticklabels([])        # remove subject IDs
-            ax_left2.set_ylabel("Subjects")
-            ax_left2.tick_params(axis='y', length=0)  # remove tick marks
-        else:
-            ax_left2.set_yticklabels(rat_labels)
-
-        ax_left2.set_ylim(0, len(rat_labels))      
-        
-        cbar = fig_heatmap_within_rat.colorbar(im2,cax=ax_cbar2)
-        
-        
-        
-        # Paperfigs condition
-        if paperfigs:
-            # Remove default vertical label
-            cbar.ax.set_ylabel('')
-
-            # Add horizontal label above the colorbar
-            # Use axes coordinates (0-1), x=0.5 centers it horizontally
-            ax_cbar2.text(
-                0.5, 1.05,           # x, y in axes fraction coordinates
-                'z-score',           # label text
-                ha='center', va='bottom',
-                fontsize=8,
-                transform=ax_cbar2.transAxes
-            )
-
-            # Always update ticks
-            vmin, vmax = -vlim, vlim
-            vmin_tick = np.ceil(vmin * 2) / 2
-            vmax_tick = np.floor(vmax * 2) / 2
-            ticks = [t for t in (vmin_tick, 0, vmax_tick) if vmin <= t <= vmax]
-            cbar.set_ticks(ticks)
-            cbar.set_ticklabels([f"{t:.1f}" for t in ticks])
-
-            # Optional: move ticks below label
-            ax_cbar2.xaxis.set_ticks_position('top')
-        else:
-            # Normal vertical label
-            cbar.set_label('Fluorescence (z-score)', fontsize=8)
-
-        fig_heatmap_within_rat.tight_layout()
-
-    plt.show()
-
-    # Save figure
-    heatmap_within_rat_base = os.path.join(
-        fig_output_path,
-        f"{processed_phase}_{rat_str}_{eventname}_within_rat_heatmap"
-    )
-    safe_save_fig(fig_heatmap_within_rat, heatmap_within_rat_base)
-    
-    
-    # -------------------
-    # -------------------
-    # Tier 3: across-animal (CORRECTED)
-    # -------------------
-
-    # ---------------------------------
-    # Build per-animal (per-rat) summary
-    # ---------------------------------
-    per_animal_epoc_stats = []
-    for rat, stats_dict in per_rat_stats.items():
-        per_animal_epoc_stats.append({
-            "rat_id": rat,
-            "cue_mean": stats_dict["cue_stats"][0],
-            "approach_mean": stats_dict["approach_stats"][0],
-            "auc_pre_mean": stats_dict["auc_pre_stats"][0],
-            "auc_post_mean": stats_dict["auc_post_stats"][0],
-            "onset_mean": stats_dict["onset_stats"][0],
-            "slope_mean": stats_dict["slope_stats"][0],
-            "time_to_peak_mean": stats_dict["time_to_peak_stats"][0],
-            "onset_peak_amp_mean": stats_dict["onset_peak_amp_stats"][0],
-            "overall_peak_amp_mean": stats_dict["overall_peak_amp_stats"][0],
-            "overall_peak_time_mean": stats_dict["overall_peak_time_stats"][0],
-        })
-
-    per_animal_stats_df = pd.DataFrame(per_animal_epoc_stats)
-
-    n_animals = len(per_animal_stats_df)
-
-    # ---------------------------------
-    # Across-animal scalar stats
-    # ---------------------------------
-    cue_mean_animal = per_animal_stats_df["cue_mean"].mean()
-    if n_animals > 1:
-        cue_sem_animal  = per_animal_stats_df["cue_mean"].std(ddof=1) / np.sqrt(n_animals)
-    else:
-        cue_sem_animal = 0.0
-        
-    approach_mean_animal = per_animal_stats_df["approach_mean"].mean()
-    if n_animals > 1:
-        approach_sem_animal  = per_animal_stats_df["approach_mean"].std(ddof=1) / np.sqrt(n_animals)
-    else:
-        approach_sem_animal = 0.0
-        
-    auc_pre_mean_animal = per_animal_stats_df["auc_pre_mean"].mean()
-    
-    if n_animals > 1:
-        auc_pre_sem_animal  = per_animal_stats_df["auc_pre_mean"].std(ddof=1) / np.sqrt(n_animals)
-    else:
-        auc_pre_sem_animal = 0.0
-        
-    auc_post_mean_animal = per_animal_stats_df["auc_post_mean"].mean()
-    if n_animals > 1:
-        auc_post_sem_animal  = per_animal_stats_df["auc_post_mean"].std(ddof=1) / np.sqrt(n_animals)
-    else:
-        auc_post_sem_animal = 0.0
-        
-    if n_animals > 1:
-        onset_sem_animal = per_animal_stats_df["onset_mean"].std(ddof=1) / np.sqrt(n_animals)
-        slope_sem_animal = per_animal_stats_df["slope_mean"].std(ddof=1) / np.sqrt(n_animals)
-    else:
-        onset_sem_animal = 0.0
-        slope_sem_animal = 0.0
-
-    onset_mean_animal = per_animal_stats_df["onset_mean"].mean()
-    slope_mean_animal = per_animal_stats_df["slope_mean"].mean()
-    
-    time_to_peak_mean_animal = per_animal_stats_df["time_to_peak_mean"].mean()
-    onset_peak_amp_mean_animal = per_animal_stats_df["onset_peak_amp_mean"].mean()
-
-    if n_animals > 1:
-        time_to_peak_sem_animal = per_animal_stats_df["time_to_peak_mean"].std(ddof=1) / np.sqrt(n_animals)
-        onset_peak_amp_sem_animal = per_animal_stats_df["onset_peak_amp_mean"].std(ddof=1) / np.sqrt(n_animals)
-    else:
-        time_to_peak_sem_animal = 0.0
-        onset_peak_amp_sem_animal = 0.0
-        
-    overall_peak_amp_mean_animal = per_animal_stats_df["overall_peak_amp_mean"].mean()
-    overall_peak_time_mean_animal = per_animal_stats_df["overall_peak_time_mean"].mean()
-
-    if n_animals > 1:
-        overall_peak_amp_sem_animal = (
-            per_animal_stats_df["overall_peak_amp_mean"].std(ddof=1)
-            / np.sqrt(n_animals)
-        )
-        overall_peak_time_sem_animal = (
-            per_animal_stats_df["overall_peak_time_mean"].std(ddof=1)
-            / np.sqrt(n_animals)
-        )
-    else:
-        overall_peak_amp_sem_animal = 0.0
-        overall_peak_time_sem_animal = 0.0
-
-    # ---------------------------------
-    # Across-animal time-resolved stats
-    # ---------------------------------
-    all_means = np.vstack([trace["mean"] for trace in per_animal_traces])
-
-    mean_across_animal = np.nanmean(all_means, axis=0)
-    if n_animals > 1:
-        sem_across_animal = (
-            np.nanstd(all_means, axis=0, ddof=1)
-            / np.sqrt(n_animals)
-        )
-    else:
-        sem_across_animal = np.zeros_like(mean_across_animal)
-
-    across_animal_stats = pd.DataFrame({
-        "mean_epoc_stream": mean_across_animal,
-        "sem_epoc_stream":  sem_across_animal
-    })
-
-
-    across_animal_epocs = pd.DataFrame({
-        "time": ts,
-        "mean_trace": mean_across_animal
-    })
-
-
-    ########### onset and slope figure
-    
-    ########### Across-Animal Onset & Slope Figure
-    fig_across_animal_onset, ax = plt.subplots(
-        figsize=master_figsize if paperfigs else (6,4)
-    )
-
-    # Plot mean trace
-    ax.plot(ts, mean_across_animal, label="Mean Trace")
-
-    # SEM shading
-    ax.fill_between(
-        ts,
-        mean_across_animal - sem_across_animal,
-        mean_across_animal + sem_across_animal,
-        alpha=0.3, linewidth=0, edgecolor='none'
-    )
-
-    # Event vertical line
-    ax.axvline(0, color="red", linestyle="-", label="Event")
-
-    # Onset vertical line
-    if not np.isnan(onset_mean_animal):
-        ax.axvline(onset_mean_animal, linestyle="--", color="magenta", label="Mean Onset")
-
-        # Include small window around onset for accurate interpolation
-        mask = (ts >= onset_mean_animal - 0.01) & (ts <= onset_mean_animal + 4)
-        t_win = ts[mask]
-        y_win = mean_across_animal[mask]
-
-        # Interpolate y at exact onset
-        y0 = np.interp(onset_mean_animal, t_win, y_win)
-
-        # Peak-based cutoff for slope line
-        onset_peak_val = np.nanmax(y_win)
-        threshold = 0.6 * onset_peak_val
-        above_thresh_idx = np.where(y_win >= threshold)[0]
-
-        if len(above_thresh_idx) > 0:
-            t_fit = t_win[:above_thresh_idx[0]+1]
-            slope_line = slope_mean_animal * (t_fit - onset_mean_animal) + y0
-            ax.plot(t_fit, slope_line, color="green", label="Mean Slope")
-
-    ax.set_title("Across-Animal Onset & Rising Slope")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Signal (z-score)")
-    ax.set_xlim(-0.5, 2.5)
-    ax.legend()
-    plt.show()
-
-    
-    
-    #################################
-    
-    # ---------------------------------
-    # Across-animal summary table
-    # ---------------------------------
-    combined_event_dict_animal = {
-        "event name": eventname,
-        "rats included": "-".join(sorted(per_rat_results.keys())),
-        "animal count": n_animals,
-        "subset": subset,
-
-        "approach window (s)": str(compute_kwargs["approach_window"]),
-        "mean approach response": f"{approach_mean_animal:.3f}",
-        "SEM approach response": f"{approach_sem_animal:.3f}",
-
-        "post window (s)": str(compute_kwargs["cue_window"]),
-        "mean post response": f"{cue_mean_animal:.3f}",
-        "SEM post response": f"{cue_sem_animal:.3f}",
-
-        "pre-event AUC window (s)": str(compute_kwargs["auc_pre_window"]),
-        "mean pre-event AUC": f"{auc_pre_mean_animal:.3f}",
-        "SEM pre-event AUC": f"{auc_pre_sem_animal:.3f}",
-
-        "post-event AUC window (s)": str(compute_kwargs["auc_post_window"]),
-        "mean post-event AUC": f"{auc_post_mean_animal:.3f}",
-        "SEM post-event AUC": f"{auc_post_sem_animal:.3f}",
-        
-        "mean onset latency (s)": f"{onset_mean_animal:.3f}",
-        "SEM onset latency (s)": f"{onset_sem_animal:.3f}",
-        "mean rise slope": f"{slope_mean_animal:.3f}",
-        "SEM rise slope": f"{slope_sem_animal:.3f}",
-        
-        "mean time to peak (s)": f"{time_to_peak_mean_animal:.3f}",
-        "SEM time to peak (s)": f"{time_to_peak_sem_animal:.3f}",
-        "mean onset peak amplitude": f"{onset_peak_amp_mean_animal:.3f}",
-        "SEM onset peak amplitude": f"{onset_peak_amp_sem_animal:.3f}",
-        
-        "overall peak window (s)": str(compute_kwargs.get("overall_peak_window", (0,8))),
-        "mean overall peak amplitude": f"{overall_peak_amp_mean_animal:.3f}",
-        "SEM overall peak amplitude": f"{overall_peak_amp_sem_animal:.3f}",
-        "mean overall peak timestamp (s)": f"{overall_peak_time_mean_animal:.3f}",
-        "SEM overall peak timestamp (s)": f"{overall_peak_time_sem_animal:.3f}",
-    }
-
-    combined_events_info_animal = (
-        pd.DataFrame.from_dict(combined_event_dict_animal, orient="index")
-          .reset_index()
-    )
-    combined_events_info_animal.columns = ["combined perievent analysis", "value"]
-    combined_events_info_animal = combined_events_info_animal.astype(str)
-
-    # ---------------------------------
-    # Save across-animal outputs
-    # ---------------------------------
-    base_all_animal = os.path.join(
-        save_dir,
-        f"{processed_phase}_{rat_str}_{eventname}_across_rat"
-    )
-    
-    base_all_animal_fig = os.path.join(
-        fig_output_path,
-        f"{processed_phase}_{rat_str}_{eventname}_across_rat"
-    )
-
-
-    safe_save_table(across_animal_epocs, base_all_animal + "_epocs_bslnd")
-    safe_save_table(across_animal_stats, base_all_animal + "_stats")
-    safe_save_table(per_animal_stats_df, base_all_animal + "_PER_ANIMAL_summary_stats")
-    safe_save_table(combined_events_info_animal, base_all_animal + "_summary")
-    safe_save_txt(
-        combined_events_info_animal.to_string(index=False),
-        base_all_animal + "_summary.txt"
-    )
-    
-    safe_save_fig(
-        fig_across_all,
-        base_all_animal_fig
-    )
-    
-    safe_save_fig(fig_across_animal_onset,
-                  base_all_animal_fig + "_onset_slope")
-
-
-    print("Across-trial SEM (approach):", approach_sem_all)
-    print("Across-animal SEM (approach):", approach_sem_animal)
-
-    print("\n✅ Perievent pipeline complete")
-
-    fig_all= {
-        "trial": fig_trial_all,
-        "across": fig_across_all,
-        "within": fig_within_all
-    }
-    
-    # -------------------------------------------------------------------------------------------------
-    # -------------------------------------------------------------------------------------------------
-    
-    if paperfigs:
-        # ---------------------------
-        # Figure setup
-        # ---------------------------
-        '''
-        fig_stack = plt.figure(figsize=(1.4, 1.925))  # total height = top 1.4 + bottom 0.525 + some space
-        gs = gridspec.GridSpec(
-            2, 2,
-            height_ratios=[1.4, 0.525],
-            width_ratios=[20, 1],
-            hspace=0.15,   # more vertical space
-            wspace=0.05
-        )
-
-        '''
-        # smaller size figure below for cues, noncont, etc. but a
-        #scale = 0.85
-        #scale = 1.42857143
-        scale = 1
-        
-        
-        fig_stack = plt.figure(figsize=(1.4*scale, 1.925*scale))
-
-        '''
-        gs = fig_stack.add_gridspec(
-            2, 2,
-            height_ratios=[1.4, 0.525],
-            width_ratios=[20, 1],
-            hspace=0.15,
-            wspace=0.05
-        )
-        '''
-        
-        height_ratios = np.array([1.4, 0.525]) * scale
-        width_ratios = np.array([20, 1]) * scale
-
-        gs = fig_stack.add_gridspec(
-            2, 2,
-            height_ratios=height_ratios,
-            width_ratios=width_ratios,
-            hspace=0.15,
-            wspace=0.05
-        )
-
-        ax_trace = fig_stack.add_subplot(gs[0, 0])
-        ax_heat = fig_stack.add_subplot(gs[1, 0], sharex=ax_trace)
-        ax_cbar = fig_stack.add_subplot(gs[1, 1])
-
-        # ---------------------------
-        # Across-animal trace
-        # ---------------------------
-        dark_green = np.array([36,106,72])/255
-        ax_trace.plot(ts, mean_across_animal, color=dark_green, lw=1.5, label="Mean across subjects")
-        ax_trace.fill_between(
-            ts,
-            mean_across_animal - sem_across_animal,
-            mean_across_animal + sem_across_animal,
-            color=dark_green,
-            alpha=0.4,
-            linewidth=0,
-            label="SEM"
-        )
-        ax_trace.axvline(0, color="red", lw=1, zorder=0)
-        ax_trace.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
-
-
-        # Remove x-axis
-        ax_trace.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
-        ax_trace.set_ylabel("Fluorescence (z-score)")
-
-        # Set y-limits and ticks
-        ax_trace.set_ylim(master_ylim)
-        ylim_span = master_ylim[1] - master_ylim[0]
-
-        if ylim_span <= 2.0:
-            # ticks every 0.5 but constrained to master_ylim
-            yticks = np.arange(master_ylim[0], master_ylim[1]+1e-6, 0.5)
-        else:
-            # ticks every 1.0 but constrained to master_ylim
-            yticks = np.arange(master_ylim[0], master_ylim[1]+1e-6, 1.0)
-
-        ax_trace.set_yticks(yticks)
-        
-        
-        ax_trace.spines['bottom'].set_visible(False)
-        
-        # ---------------------------
-        # Excel significance markers (dynamic vertical spacing)
-        # ---------------------------
-        if excel_file_path is not None:
-            try:
-                sig_excel = pd.read_excel(excel_file_path, sheet_name=None)
-                y_top = master_ylim[1]
-
-                # Count total rows of markers (group comparisons + baseline)
-                n_group_sheets = len([name for name in sig_excel.keys() if "vs" in name.lower()]) if plot_group_comparison else 0
-                n_baseline_cols = len(sig_excel["Significance From Baseline"].columns) if (plot_baseline_significance and "Significance From Baseline" in sig_excel) else 0
-                total_rows = max(n_group_sheets + n_baseline_cols, 1)
-
-                # 15% of axis for all markers, stack them evenly
-                total_marker_height = 0.15 * (master_ylim[1] - master_ylim[0])
-                spacing = total_marker_height / max(total_rows, 1)
-                height = y_top + (total_rows - 1 - i) * spacing  # topmost row highest                
-                
-                legend_handles = []
-                legend_labels = []
-
-                # GROUP COMPARISONS
-                if plot_group_comparison:
-                    comparison_sheets = [name for name in sig_excel.keys() if "vs" in name.lower()]
-                    n_sheets = len(comparison_sheets)
-                    # Define key RGB colors for gradient: purple -> red -> orange
-                    key_colors = np.array([
-                        [128, 0, 128],    # purple
-                        [255, 0, 0],      # red
-                        [255, 165, 0]     # orange
-                    ]) / 255  # normalize to 0-1
-
-                    # Create a colormap spanning these colors
-                    from matplotlib.colors import LinearSegmentedColormap
-                    gradient_cmap = LinearSegmentedColormap.from_list("purple_red_orange", key_colors, N=256)
-                    # Sample n_sheets colors evenly along the gradient
-                    #colors = [gradient_cmap(i / max(n_sheets-1, 1)) for i in range(n_sheets)]
-
-                    # 2️⃣ List all possible pairwise comparisons among 4 groups
-                    all_comparisons = [
-                        "Group 1 vs Group 2",
-                        "Group 1 vs Group 3",
-                        "Group 1 vs Group 4",
-                        "Group 2 vs Group 3",
-                        "Group 2 vs Group 4",
-                        "Group 3 vs Group 4"
-                    ]
-                    # 3️⃣ Sample colors evenly along the gradient
-                    n_total = len(all_comparisons)
-                    comparison_colors = {comp: gradient_cmap(i / (n_total - 1)) for i, comp in enumerate(all_comparisons)}
-
-                    for i, sheet_name in enumerate(comparison_sheets):
-                        sig_vals = sig_excel[sheet_name].iloc[:,0].to_numpy()
-                        if len(sig_vals) > 1:
-                            sig_times = np.linspace(epoc_ts.min(), epoc_ts.max(), len(sig_vals))
-                            interp_vals = np.interp(ts, sig_times, sig_vals)
-                            mask = interp_vals > 0.5
-                            height = y_top * (0.95 - i*spacing)  # scale dynamically
-
-                            sc = ax_trace.scatter(
-                                ts[mask],
-                                height*np.ones(np.sum(mask)),
-                                marker='o',
-                                color=comparison_colors.get(sheet_name, (0.5,0.5,0.5)),  # fallback gray if missing
-                                linewidths=0,
-                                edgecolors='none',
-                                s=7,
-                                label=sheet_name
-                            )
-
-                            legend_handles.append(sc)
-                            legend_labels.append(sheet_name)
-
-                # BASELINE SIGNIFICANCE
-                if plot_baseline_significance and "Significance From Baseline" in sig_excel:
-                    sig_base = sig_excel["Significance From Baseline"]
-                    cmap = plt.get_cmap("tab10")
-                    for j, col in enumerate(sig_base.columns):
-                        sig_vals = sig_base[col].to_numpy()
-                        if len(sig_vals) > 1:
-                            sig_times = np.linspace(epoc_ts.min(), epoc_ts.max(), len(sig_vals))
-                            interp_vals = np.interp(ts, sig_times, sig_vals)
-                            mask = interp_vals > 0.5
-                            baseline_offset = n_group_sheets
-                            height = y_top * (0.95 - (baseline_offset + j)*spacing)
-                            sc = ax_trace.scatter(
-                                ts[mask],
-                                height*np.ones(np.sum(mask)),
-                                marker='o',
-                                #color=cmap(j%10),
-                                color=dark_green,
-                                linewidths=0,
-                                edgecolors='none',
-                                s=7,
-                                label=f"{col} baseline"
-                            )
-                            #legend_handles.append(sc)
-                            #legend_labels.append(f"{col} baseline")               
-                
-                # Legend off to the side
-                # Create a "patch" representing SEM
-                sem_patch = Rectangle((0,0), 1, 1, facecolor=dark_green, alpha=0.4, edgecolor='none')
-                # Create a line representing the mean
-                mean_line = Line2D([0,1],[0,0], color=dark_green, lw=1.5)
-                # --- Baseline significance markers (collapsed into one) ---
-                baseline_handle = Line2D(
-                    [0], [0],
-                    marker='o',
-                    color='none',
-                    markerfacecolor=dark_green,
-                    markeredgecolor='none',  # remove black outline
-                    markeredgewidth=0,
-                    markersize=3,             # match scatter s=10 (~3pt)
-                    linestyle='None',
-                    label='Event-related transient'
-                )
-
-                # Use a tuple as a single legend entry
-  
-                all_handles = [(sem_patch, mean_line)] + [baseline_handle] + legend_handles
-                all_labels  = ["Mean across subjects"] + ["Event-related transient"] + legend_labels
-
-                
-                ax_trace.legend(
-                    handles=all_handles,
-                    labels=all_labels,
-                    handler_map={tuple: HandlerTuple(ndivide=None)},
-                    loc='center left',
-                    bbox_to_anchor=(1.35, 0.5),
-                    fontsize=7,
-                    frameon=True,
-                    markerscale=2
-                )
-                
-
-            except Exception as e:
-                print("⚠️ Could not overlay Excel significance:", e)
-
-        # ---------------------------
-        # Heatmap
-        # ---------------------------
-        im = ax_heat.imshow(
-            heatmap_within_rat_data,
-            aspect='auto',
-            extent=extent2,
-            origin='lower',
-            cmap=custom_cmap,
-            norm=norm,
-            interpolation='nearest'
-        )
-        ax_heat.axvline(0, color="red", lw=1)
-        ax_heat.set_xlabel("Time (s)")
-        ax_heat.set_xticks([-5,0,5,10,15])
-        ax_heat.set_yticks([])  # remove y ticks
-        ax_heat.set_ylabel("Subjects")
-
-        # ---------------------------
-        # Colorbar
-        # ---------------------------
-        cbar = fig_stack.colorbar(im, cax=ax_cbar)
-        cbar.ax.set_ylabel("")
-        
-        ax_cbar.set_position([
-            ax_heat.get_position().x1 + 0.05,  # small offset to the right
-            ax_heat.get_position().y0,
-            0.03,                              # width of colorbar
-            ax_heat.get_position().height
-        ])
-        
-        ax_cbar.text(
-            0.5, 1.12,
-            "z-score",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            transform=ax_cbar.transAxes
-        )
-        cbar.outline.set_visible(False)
-
-        fig_stack.tight_layout()
-        
-        safe_save_fig(
-            fig_stack,
-            os.path.join(fig_output_path, f"{processed_phase}_{rat_str}_{eventname}_stacked")
-        )
-        plt.show()        
-        
-    
-    # -------------------------------------------------------------------------------------------------
-    # -------------------------------------------------------------------------------------------------
- 
-    return {
-        # --- Within-rat / per-rat ---
-        "per_rat": per_rat_results,
-        "per_rat_stats": per_rat_stats,  # cue/approach/AUC per rat
-        "per_epoc_stats_within_rat": per_epoc_stats_all,
-        "within_animal_epocs_mean": within_animal_epocs_mean,
-        "within_animal_epocs_sem": within_animal_epocs_sem,
-        "file_level_epoc_latency_count": file_summary_df,
-
-        # --- Across-trial ---
-        "combined_epocs_across_trial": combined_epocs_all,
-        "combined_epocs_baselined_across_trial": combined_baselined_all,
-        "combined_stats_across_trial": combined_stats_all,
-        "combined_events_info_across_trial": combined_events_info_trial,
-
-        # --- Across-animal ---
-        "across_animal_stats": across_animal_stats,   # time-resolved mean/SEM
-        "across_animal_epocs": across_animal_epocs,   # mean trace
-        "per_animal_stats": per_animal_stats_df,      # per-rat summary
-        "combined_events_info_across_animal": combined_events_info_animal,
-
-        # --- Figures ---
-        "fig_all": fig_all,
-
-        # --- Summary stats for convenience ---
-        "cue_stats_across_trial": (cue_mean_all, cue_sem_all),
-        "approach_stats_across_trial": (approach_mean_all, approach_sem_all),
-        "auc_pre_stats_across_trial": (auc_pre_mean_all, auc_pre_sem_all),
-        "auc_post_stats_across_trial": (auc_post_mean_all, auc_post_sem_all),
-
-        "cue_stats_across_animal": (cue_mean_animal, cue_sem_animal),
-        "approach_stats_across_animal": (approach_mean_animal, approach_sem_animal),
-        "auc_pre_stats_across_animal": (auc_pre_mean_animal, auc_pre_sem_animal),
-        "auc_post_stats_across_animal": (auc_post_mean_animal, auc_post_sem_animal),
-        
-        "onset_stats_across_trial": (onset_mean_all, onset_sem_all),
-        "slope_stats_across_trial": (slope_mean_all, slope_sem_all),
-        "onset_stats_across_animal": (onset_mean_animal, onset_sem_animal),
-        "slope_stats_across_animal": (slope_mean_animal, slope_sem_animal),
-        
-        "time_to_peak_stats_across_trial": (time_to_peak_mean_all, time_to_peak_sem_all),
-        "onset_peak_amp_stats_across_trial": (onset_peak_amp_mean_all, onset_peak_amp_sem_all),
-        "overall_peak_amp_stats_across_trial": (overall_peak_amp_mean_all, overall_peak_amp_sem_all),
-        "overall_peak_time_stats_across_trial": (overall_peak_time_mean_all, overall_peak_time_sem_all),
-
-        "time_to_peak_stats_across_animal": (time_to_peak_mean_animal, time_to_peak_sem_animal),
-        "onset_peak_amp_stats_across_animal": (onset_peak_amp_mean_animal, onset_peak_amp_sem_animal),
-        "overall_peak_amp_stats_across_animal": (overall_peak_amp_mean_animal, overall_peak_amp_sem_animal),
-        "overall_peak_time_stats_across_animal": (overall_peak_time_mean_animal, overall_peak_time_sem_animal),
-    }
-
-
-
-
-
-# concatenate multiple recording segments for stats and plotting ---------------------------------------------------------------------    
-
-def chunks_concat_compute_plot(
-        *,
-        feather_folder=None,
-        file_pattern=None,
-        feather_files=None,
-        new_fs=20.0,
-        ts=None,
-        trange=None,
-        baseline_trange=None,
-        cue_window=None,
-        auc_pre_window=None,
-        auc_post_window=None,
-        approach_window=None,
-        plot_auc_region=False,
-        plot=True,
-        per_animal_traces=None,
-        per_animal_labels=None,
-        subset = None,
-        # --- NEW ONSET/SLOPE PARAMETERS ---
-        onset_search_window=(0, 3),
-        deriv_threshold=0.05,
-        deriv_smooth_window=7,
-        deriv_smooth_poly=6,
-        consecutive_points=2,
-        peak_fraction=0.5,
-        min_peak_amplitude=-1,
-        amp_onset_fraction=0.1,
-        plot_onset_detection = False,
-        plot_individual_trials = False,
-        master_xlim = None,
-        master_ylim = None,
-        overall_peak_window = (0,8),
-        rat_name = None,
-        excel_file_path = None,
-        plot_group_comparison=False,
-        plot_baseline_significance=False,
-        paperfigs = False,
-        master_figsize = (8, 8)
-):
-    """
-    Loads and concatenates GCaMP_465 epocs feather files, computes statistics,
-    plots peri-event responses, AND computes per-epoc baselined window stats.
-
-    Returns
-    -------
-    (
-        combined_epocs,                  # raw concatenated data
-        combined_epocs_baselined,        # baseline-subtracted data
-        epoc_stats,                      # mean/SEM/std for plotting
-        mean_epoc_stream,
-        std_epoc_stream,
-        sem_epoc_stream,
-        fig_across,
-        fig_within,
-        fig_trials,
-        None,
-        (cue_mean, cue_sem),
-        (auc_pre_mean, auc_pre_sem),
-        (auc_post_mean, auc_post_sem),
-        (approach_mean, approach_sem),
-        fig_onset,
-        (onset_mean, onset_sem),
-        (slope_mean, slope_sem),
-        (time_to_peak_mean, time_to_peak_sem),
-        (onset_peak_amp_mean, onset_peak_amp_sem),
-        (overall_peak_amp_mean, overall_peak_amp_sem),
-        (overall_peak_time_mean, overall_peak_time_sem),
-        per_epoc_stats_df               # per-column stats
-    )
-    """
-    import os, glob, re
-    from pathlib import Path
-    import pandas as pd
-    import numpy as np
-    from scipy import stats
-    import matplotlib.pyplot as plt
-    from scipy.ndimage import gaussian_filter1d
-    from statsmodels.api import RLM, add_constant
-    from scipy.stats import linregress
-    from matplotlib.ticker import MultipleLocator
-
-    def configure_axis(ax):
-        ax.yaxis.set_major_locator(MultipleLocator(1))
-        ax.minorticks_off()
-
-    # ---------------------
-    # Gather files
-    # ---------------------
-    if feather_files is not None:
-        feather_files = list(feather_files)
-    else:
-        if feather_folder is None:
-            raise ValueError("Either 'feather_files' or 'feather_folder' must be provided")
-        if isinstance(feather_folder, str):
-            feather_folder = [feather_folder]
-        feather_files = []
-        for folder in feather_folder:
-            if file_pattern is None:
-                raise ValueError("'file_pattern' must be provided if feather_files is None")
-            feather_files.extend(glob.glob(os.path.join(folder, file_pattern)))
-
-    if not feather_files:
-        raise FileNotFoundError("No feather files found")
-
-    # ---------------------
-    # Load and concatenate
-    # ---------------------
-    epoc_dfs = []
-    epoc_rats = []
-    epoc_sources_per_df = []
-
-    for f in feather_files:
-        df = pd.read_feather(f)
-        
-        # ---------------------
-        # Optional subsetting
-        # ---------------------
-        if subset is not None:
-            n_cols = df.shape[1]
-
-            if isinstance(subset, int):
-                if subset > 0:
-                    # First N
-                    df = df.iloc[:, :min(subset, n_cols)]
-                elif subset < 0:
-                    # Last N
-                    df = df.iloc[:, max(0, n_cols + subset):]
-
-            elif isinstance(subset, (list, tuple)) and len(subset) == 2:
-                start, end = subset
-
-                # Convert 1-indexed inclusive to 0-indexed slice
-                start_idx = max(start - 1, 0)
-                end_idx   = min(end, n_cols)
-
-                if start_idx < end_idx:
-                    df = df.iloc[:, start_idx:end_idx]
-                else:
-                    df = df.iloc[:, 0:0]  # empty safely
-
-            else:
-                raise ValueError("subset must be int, negative int, or [start, end]")
-
-        if df.shape[1] == 0:
-            continue
-
-        fname = Path(f).stem
-        rat_match = re.search(r'ACW_coh5_IT_[fm]\d+', fname)
-        rat_id = rat_match.group(0) if rat_match else "unknown_rat"
-
-        df.columns = [f"{rat_id}_{col}" for col in df.columns]
-        epoc_dfs.append(df)
-        epoc_rats.append(rat_id)
-
-        # Track source file for each column
-        epoc_sources_per_df.append([Path(f).name] * df.shape[1])
-        
-    if len(epoc_dfs) == 0:
-        raise ValueError("No epocs remaining after subsetting/baseline filtering.")
-
-    combined_epocs = pd.concat(epoc_dfs, axis=1).reset_index(drop=True)
-
-    # Deduplicate columns if needed
-    def dedupe_columns(cols):
-        seen = {}
-        out = []
-        for c in cols:
-            if c not in seen:
-                seen[c] = 0
-                out.append(c)
-            else:
-                seen[c] += 1
-                out.append(f"{c}__{seen[c]}")
-        return out
-
-    combined_epocs.columns = dedupe_columns(combined_epocs.columns)
-
-    # ---------------------
-    # Baseline correction
-    # ---------------------
-    if baseline_trange is not None:
-        baseline_start_idx = int((baseline_trange[0] - trange[0]) * new_fs)
-        baseline_end_idx   = int((baseline_trange[1] - trange[0]) * new_fs)
-
-        filtered_epoc_dfs = []
-        filtered_sources = []
-
-        for df, src_list in zip(epoc_dfs, epoc_sources_per_df):
-
-            baseline_slice = df.iloc[baseline_start_idx:baseline_end_idx]
-            valid_fraction = baseline_slice.notna().sum(axis=0) / len(baseline_slice)
-            keep_cols = valid_fraction[valid_fraction >= 0.1].index
-
-            filtered_df = df[keep_cols]
-            filtered_epoc_dfs.append(filtered_df)
-
-            # Filter matching sources correctly
-            keep_mask = df.columns.isin(keep_cols)
-            filtered_sources.extend(np.array(src_list)[keep_mask].tolist())
-
-        if len(filtered_epoc_dfs) == 0 or all(df.shape[1] == 0 for df in filtered_epoc_dfs):
-            raise ValueError("No epocs remaining after baseline filtering.")
-
-        combined_epocs = pd.concat(filtered_epoc_dfs, axis=1).reset_index(drop=True)
-        combined_epocs.columns = dedupe_columns(combined_epocs.columns)
-
-        baseline_slice = combined_epocs.iloc[baseline_start_idx:baseline_end_idx]
-        baselines = baseline_slice.mean()
-        combined_epocs_baselined = combined_epocs.subtract(baselines, axis=1)
-        data_to_use = combined_epocs_baselined
-
-        epoc_sources = filtered_sources  # <- update the sources list
-    else:
-        combined_epocs_baselined = combined_epocs.copy()
-        data_to_use = combined_epocs_baselined
-
-
-    # After baseline correction
-    if trange is not None:
-        start_idx = max(int((trange[0] - trange[0]) * new_fs), 0)  # 0 offset
-        end_idx   = min(int((trange[1] - trange[0]) * new_fs), data_to_use.shape[0])
-        data_to_use = data_to_use.iloc[start_idx:end_idx]
-
-    # ---------------------
-    # Time vector
-    # ---------------------
-    epoc_ts = trange[0] + np.arange(len(data_to_use)) / new_fs
-
-    #epoc_ts = np.linspace(trange[0], trange[1], data_to_use.shape[0])
-    
-    ###################################
-
-    dt = epoc_ts[1] - epoc_ts[0]
-
-    # ============================================================
-    # 🔬 ONSET + SLOPE DETECTION
-    # ============================================================
-    
-    
-    from statsmodels.robust.robust_linear_model import RLM
-    from statsmodels.tools import add_constant
-    from scipy.signal import savgol_filter
-    import numpy as np
-
-    
-    
-    def detect_onset_and_slope(
-            y, epoc_ts, dt,
-            onset_search_window,
-            deriv_threshold,
-            deriv_smooth_window,
-            deriv_smooth_poly,
-            consecutive_points,
-            peak_fraction,
-            min_peak_amplitude,
-            amp_onset_fraction
-    ):
-        """
-        Detect onset, rising slope, time-to-peak, and peak amplitude
-        using derivative + amplitude logic with full numerical safeguards.
-
-        Returns
-        -------
-        onset_time : float
-        slope : float
-        time_to_peak : float
-        peak_val : float
-        """
-
-        import numpy as np
-        from scipy.signal import savgol_filter
-        from statsmodels.robust.robust_linear_model import RLM
-        from statsmodels.tools import add_constant
-
-        # -----------------------------
-        # Restrict to onset search window
-        # -----------------------------
-        mask = (epoc_ts >= onset_search_window[0]) & (epoc_ts <= onset_search_window[1])
-        if mask.sum() < 3:
-            return np.nan, np.nan, np.nan, np.nan
-
-        y_win = y[mask]
-        ts_win = epoc_ts[mask]
-
-        # -----------------------------
-        # Remove NaNs early
-        # -----------------------------
-        if np.all(np.isnan(y_win)):
-            return np.nan, np.nan, np.nan, np.nan
-
-        if np.any(np.isnan(y_win)):
-            return np.nan, np.nan, np.nan, np.nan
-
-
-        # -----------------------------
-        # Smooth signal for peak detection
-        # -----------------------------
-        from scipy.ndimage import gaussian_filter1d
-        y_smooth = gaussian_filter1d(y_win, sigma=2)
-
-        # -----------------------------
-        # Peak detection (on smoothed signal)
-        # -----------------------------
-        peak_idx = np.nanargmax(y_smooth)
-        onset_peak_val = y_smooth[peak_idx]
-        onset_peak_time = ts_win[peak_idx]
-        
-        
-        if onset_peak_val < min_peak_amplitude:
-            return np.nan, np.nan, np.nan, np.nan
-
-        # -----------------------------
-        # Validate Savitzky–Golay window
-        # -----------------------------
-        max_window = len(y_win)
-        if max_window % 2 == 0:
-            max_window -= 1  # must be odd
-
-        window_length = min(deriv_smooth_window, max_window)
-
-        if window_length <= deriv_smooth_poly:
-            return np.nan, np.nan, np.nan, np.nan
-
-        if window_length < 3:
-            return np.nan, np.nan, np.nan, np.nan
-
-        # -----------------------------
-        # Compute derivative safely
-        # -----------------------------
-        try:
-            dydt = savgol_filter(
-                y_win,
-                window_length=window_length,
-                polyorder=deriv_smooth_poly,
-                deriv=1,
-                delta=dt
-            )
-        except Exception:
-            return np.nan, np.nan, np.nan, np.nan
-
-        if np.all(np.isnan(dydt)):
-            return np.nan, np.nan, np.nan, np.nan
-
-        # -----------------------------
-        # Dynamic derivative threshold
-        # -----------------------------
-        max_dydt = np.nanmax(dydt)
-        dynamic_threshold = max(deriv_threshold, 0.1 * max_dydt)
-        above = dydt > dynamic_threshold
-
-        # -----------------------------
-        # Derivative-based onset
-        # -----------------------------
-        onset_idx_deriv = None
-        for i in range(len(above) - consecutive_points + 1):
-            if np.all(above[i:i + consecutive_points]):
-                onset_idx_deriv = i
-                break
-
-        # -----------------------------
-        # Amplitude-based onset
-        # -----------------------------
-        amp_threshold = amp_onset_fraction * onset_peak_val
-        onset_candidates_amp = np.where(y_win >= amp_threshold)[0]
-        onset_idx_amp = onset_candidates_amp[0] if len(onset_candidates_amp) > 0 else None
-
-        # -----------------------------
-        # Combine logic
-        # -----------------------------
-        if onset_idx_deriv is None and onset_idx_amp is None:
-            return np.nan, np.nan, np.nan, np.nan
-
-        if onset_idx_deriv is None:
-            onset_idx = onset_idx_amp
-        elif onset_idx_amp is None:
-            onset_idx = onset_idx_deriv
-        else:
-            onset_idx = min(onset_idx_deriv, onset_idx_amp)
-
-        onset_time = ts_win[onset_idx]
-
-        # -----------------------------
-        # Time-to-peak
-        # -----------------------------
-        time_to_peak = onset_peak_time - onset_time
-
-        if time_to_peak <= 0:
-            return onset_time, np.nan, np.nan, onset_peak_val
-
-        # -----------------------------
-        # Rising slope fit window
-        # -----------------------------
-        threshold_val = peak_fraction * onset_peak_val
-        above_thresh = np.where(y_win >= threshold_val)[0]
-        valid_end = above_thresh[above_thresh > onset_idx]
-
-        end_idx = valid_end[0] if len(valid_end) > 0 else peak_idx
-
-        if end_idx <= onset_idx:
-            return onset_time, np.nan, time_to_peak, onset_peak_val
-
-        x_fit = ts_win[onset_idx:end_idx + 1]
-        y_fit = y_win[onset_idx:end_idx + 1]
-
-        if len(x_fit) < 3:
-            return onset_time, np.nan, time_to_peak, onset_peak_val
-
-        # -----------------------------
-        # Robust linear fit
-        # -----------------------------
-        try:
-            X = add_constant(x_fit)
-            rlm_model = RLM(y_fit, X)
-            slope = rlm_model.fit().params[1]
-        except Exception:
-            slope = np.nan
-
-        return onset_time, slope, time_to_peak, onset_peak_val
-
-    onset_dict = {}
-    slope_dict = {}
-    time_to_peak_dict = {}
-    onset_peak_amp_dict = {}
-    
-    dt = epoc_ts[1] - epoc_ts[0]
-
-    for col in data_to_use.columns:
-        y = data_to_use[col].values
-        onset, slope, ttp, onset_peak_amp = detect_onset_and_slope(
-            y, epoc_ts, dt,
-            onset_search_window=onset_search_window,
-            deriv_threshold=deriv_threshold,
-            deriv_smooth_window=deriv_smooth_window,
-            deriv_smooth_poly=deriv_smooth_poly,
-            consecutive_points=consecutive_points,
-            peak_fraction=peak_fraction,
-            min_peak_amplitude=min_peak_amplitude,
-            amp_onset_fraction=amp_onset_fraction
-        )
-        onset_dict[col] = onset
-        slope_dict[col] = slope
-        time_to_peak_dict[col] = ttp
-        onset_peak_amp_dict[col] = onset_peak_amp
-
-
-    # ============================================================
-    # 🔬 OVERALL PEAK AMPLITUDE (within defined window)
-    # ============================================================
-    
-    overall_peak_amp_dict = {}
-    overall_peak_time_dict = {}
-
-    if overall_peak_window is not None:
-        w_start, w_end = overall_peak_window
-        win_mask = (epoc_ts >= w_start) & (epoc_ts <= w_end)
-
-        for col in data_to_use.columns:
-            y = data_to_use[col].values
-            y_win = y[win_mask]
-            ts_win = epoc_ts[win_mask]
-
-            if len(y_win) == 0 or np.all(np.isnan(y_win)):
-                overall_peak_amp_dict[col] = np.nan
-                overall_peak_time_dict[col] = np.nan
-                continue
-
-            peak_idx = np.nanargmax(y_win)
-            overall_peak_amp_dict[col] = y_win[peak_idx]
-            overall_peak_time_dict[col] = ts_win[peak_idx]
-    else:
-        for col in data_to_use.columns:
-            overall_peak_amp_dict[col] = np.nan
-            overall_peak_time_dict[col] = np.nan
-    
-    
-    # ---------------------
-    # Per-epoc stats (fixed for proper alignment)
-    # ---------------------
-    per_epoc_stats_df = pd.DataFrame(index=data_to_use.columns)
-    per_epoc_stats_df.index.name = "epoc_id"
-
-    # Map onset/slope
-    per_epoc_stats_df["response_latency_sec"] = [onset_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["rising_slope"] = [slope_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["time_to_peak_sec"] = [time_to_peak_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["onset_peak_amplitude"] = [onset_peak_amp_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["overall_peak_amp"] = [
-    overall_peak_amp_dict.get(epoc, np.nan)
-        for epoc in per_epoc_stats_df.index
-    ]
-
-    per_epoc_stats_df["overall_peak_amp_timestamp"] = [
-        overall_peak_time_dict.get(epoc, np.nan)
-        for epoc in per_epoc_stats_df.index
-    ]
-
-    # ---------------------
-    
-    # Per-rat mean + SEM
-    # ---------------------
-    latency_vals = per_epoc_stats_df["response_latency_sec"].values
-    slope_vals = per_epoc_stats_df["rising_slope"].values
-    time_to_peak_vals = per_epoc_stats_df["time_to_peak_sec"].values
-    onset_peak_amp_vals = per_epoc_stats_df["onset_peak_amplitude"].values
-    
-
-    onset_mean = np.nanmean(latency_vals)
-    onset_sem = stats.sem(latency_vals, nan_policy="omit")
-
-    slope_mean = np.nanmean(slope_vals)
-    slope_sem = stats.sem(slope_vals, nan_policy="omit")
-    
-    time_to_peak_mean = np.nanmean(time_to_peak_vals)
-    time_to_peak_sem = stats.sem(time_to_peak_vals, nan_policy="omit")
-
-    onset_peak_amp_mean = np.nanmean(onset_peak_amp_vals)
-    onset_peak_amp_sem = stats.sem(onset_peak_amp_vals, nan_policy="omit")
-
-    overall_peak_vals = per_epoc_stats_df["overall_peak_amp"].values
-    overall_peak_time_vals = per_epoc_stats_df["overall_peak_amp_timestamp"].values
-
-    overall_peak_amp_mean = np.nanmean(overall_peak_vals)
-    overall_peak_amp_sem  = stats.sem(overall_peak_vals, nan_policy="omit")
-
-    overall_peak_time_mean = np.nanmean(overall_peak_time_vals)
-    overall_peak_time_sem  = stats.sem(overall_peak_time_vals, nan_policy="omit")
-
-    per_rat_onset_stats = {
-        "latency_mean": onset_mean,
-        "latency_sem": onset_sem,
-        "slope_mean": slope_mean,
-        "slope_sem": slope_sem,
-        "time_to_peak_mean": time_to_peak_mean,
-        "time_to_peak_sem":  time_to_peak_sem,
-        "onset_peak_amp_mean": onset_peak_amp_mean,
-        "onset_peak_amp_sem": onset_peak_amp_sem,
-        "overall_peak_amp_mean": overall_peak_amp_mean,
-        "overall_peak_amp_sem": overall_peak_amp_sem,
-        "overall_peak_time_mean": overall_peak_time_mean,
-        "overall_peak_time_sem": overall_peak_time_sem,
-    }
-
-    # ============================================================
-    # OPTIONAL VISUALIZATION
-    # ============================================================
-    # ============================================================
-    # 📊 INDIVIDUAL TRIAL + PEAK TIMING PLOT (PER ANIMAL)
-    # ============================================================
-
-    fig_trials = None
-
-    
-    if plot_individual_trials:
-
-        fig_trials, ax1 = plt.subplots(figsize=master_figsize if paperfigs else (11,6))
-
-        if paperfigs:
-            configure_axis(ax1)
-            
-        import matplotlib.cm as cm
-        import matplotlib.colors as mcolors
-
-        n_trials = len(data_to_use.columns)
-        cmap = cm.get_cmap("viridis")
-        norm = mcolors.Normalize(vmin=0, vmax=n_trials - 1)
-
-        peak_times = []
-        peak_vals  = []
-
-        for i, col in enumerate(data_to_use.columns):
-
-            trace = data_to_use[col].values
-
-            # Plot trace
-            ax1.plot(
-                epoc_ts,
-                trace,
-                color=cmap(norm(i)),
-                alpha=0.8,
-                linewidth=1
-            )
-
-            # Get peak time from your existing table
-            peak_time = overall_peak_time_dict[col]
-            peak_val  = overall_peak_amp_dict[col]
-
-            peak_times.append(peak_time)
-            peak_vals.append(peak_val)
-
-            # Plot peak marker
-            ax1.scatter(
-                peak_time,
-                peak_val,
-                color=cmap(norm(i)),
-                edgecolor="white",
-                s=80,
-                zorder=5
-            )
-
-        # Mean trace
-        mean_epoc_stream_plot = np.nanmean(data_to_use, axis=1)
-        ax1.plot(
-            epoc_ts,
-            mean_epoc_stream_plot,
-            color="red",
-            linewidth=3,
-            label="Mean"
-        )
-
-        ax1.axvline(0, color="red", linestyle="--", linewidth=1, zorder=0)
-
-        # Optional: annotate jitter (SD of peak times)
-        peak_sd = np.nanstd(peak_times)
-        ax1.text(
-            0.02, 0.95,
-            f"Peak Time SD = {peak_sd:.3f}s",
-            transform=ax1.transAxes,
-            verticalalignment="top"
-        )
-
-        title_name = rat_name if rat_name is not None else "Animal"
-        ax1.set_title(f"{title_name} - Individual Trials with Peaks")
-
-        ax1.set_xlabel("Time (s)")
-        ax1.set_ylabel("Signal")
-
-        plt.tight_layout()
-
-    fig_onset = None
-
-    if plot_onset_detection and per_animal_traces is not None and len(per_animal_traces) > 0:
-        with plt.ioff():  # prevent automatic display
-            fig_onset, ax = plt.subplots(figsize=(8,6))
-            for col in data_to_use.columns:
-                y = data_to_use[col].values
-                ax.plot(epoc_ts, y, alpha=0.3)
-
-                onset = onset_dict[col]
-                slope = slope_dict[col]
-
-                if not np.isnan(onset) and not np.isnan(slope):
-                    ax.axvline(onset, linestyle='--', alpha=0.5)
-                    ax.axvline(0, linestyle="-", color="red", label="event")
-
-                    y0 = np.interp(onset, epoc_ts, y)
-                    x_line = np.linspace(onset, onset + 1.0, 50)
-                    y_line = y0 + slope * (x_line - onset)
-                    ax.plot(x_line, y_line, linewidth=2)
-
-            ax.set_title("Response onset and slope detection")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Fluorescence (z-score)")
-            ax.set_xlim(-0.5,3)
-
-    ###################################
-    
-    
-    # ---------------------
-    # Mean / std / SEM
-    # ---------------------
-    n_trials = data_to_use.shape[1]
-    
-    mean_epoc_stream = np.nanmean(data_to_use, axis=1)
-    if n_trials > 1:
-        std_epoc_stream = np.nanstd(data_to_use, axis=1, ddof=1)
-        sem_epoc_stream = stats.sem(data_to_use, axis=1, nan_policy='omit')
-    else:
-        std_epoc_stream = np.zeros_like(mean_epoc_stream)
-        sem_epoc_stream = np.zeros_like(mean_epoc_stream)
-
-    # ---------------------
-    # Window-level stats
-    # ---------------------
-    def window_stats(window):
-        if window is None:
-            return np.nan, np.nan
-        start_idx = np.searchsorted(epoc_ts, window[0])
-        end_idx   = np.searchsorted(epoc_ts, window[1])
-        wdata = data_to_use.iloc[start_idx:end_idx]
-        if wdata.empty:
-            return np.nan, np.nan
-        mean_val = wdata.mean().mean()
-        sem_val  = stats.sem(wdata.mean(), nan_policy='omit')
-        return mean_val, sem_val
-
-    cue_mean, cue_sem = window_stats(cue_window)
-    approach_mean, approach_sem = window_stats(approach_window)
-
-    # ---------------------
-    # AUC
-    # ---------------------
-    def compute_auc(window):
-        if window is None:
-            return np.nan, np.nan
-        start_idx = np.searchsorted(epoc_ts, window[0])
-        end_idx   = np.searchsorted(epoc_ts, window[1])
-        auc_vals = []
-        for col in data_to_use.columns:
-            y = data_to_use[col].iloc[start_idx:end_idx].values
-            x = epoc_ts[start_idx:end_idx]
-            finite_mask = np.isfinite(y)
-            if finite_mask.sum() < 2:
-                continue
-            auc = np.trapz(y[finite_mask], x[finite_mask])
-            if np.isfinite(auc):
-                auc_vals.append(auc)
-        if len(auc_vals) == 0:
-            return np.nan, np.nan
-        auc_vals = np.array(auc_vals)
-        mean_auc = np.mean(auc_vals)
-        sem_auc  = stats.sem(auc_vals) if len(auc_vals) > 1 else np.nan
-        return mean_auc, sem_auc
-
-    auc_pre_mean, auc_pre_sem   = compute_auc(auc_pre_window)
-    auc_post_mean, auc_post_sem = compute_auc(auc_post_window)
-
-    # ---------------------
-    # Per-epoc stats
-    # ---------------------
-    def per_epoc_window_mean(window):
-        if window is None:
-            return {}
-        start_idx = np.searchsorted(epoc_ts, window[0])
-        end_idx   = np.searchsorted(epoc_ts, window[1])
-        return {col: data_to_use[col].iloc[start_idx:end_idx].mean() for col in data_to_use.columns}
-
-    def per_epoc_auc(window):
-        if window is None:
-            return {}
-        start_idx = np.searchsorted(epoc_ts, window[0])
-        end_idx   = np.searchsorted(epoc_ts, window[1])
-        out = {}
-        for col in data_to_use.columns:
-            y = data_to_use[col].iloc[start_idx:end_idx].values
-            x = epoc_ts[start_idx:end_idx]
-            if len(x) == len(y) and np.any(np.isfinite(y)):
-                out[col] = float(np.trapz(y, x))
-        return out
-
-    
-    # Map window means
-    cue_vals = per_epoc_window_mean(cue_window)
-    approach_vals = per_epoc_window_mean(approach_window)
-    auc_pre_vals = per_epoc_auc(auc_pre_window)
-    auc_post_vals = per_epoc_auc(auc_post_window)
-
-    per_epoc_stats_df["cue_mean"] = [cue_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["approach_mean"] = [approach_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["auc_pre"] = [auc_pre_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["auc_post"] = [auc_post_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-
-    # Add source file
-    per_epoc_stats_df["source_file"] = epoc_sources
-
-    # Reset index if you want epoc_id as a column
-    per_epoc_stats_df = per_epoc_stats_df.reset_index()
-    
-    # ---------------------
-    # Stats DataFrame (time-resolved)
-    # ---------------------
-    epoc_stats = pd.DataFrame({
-        "mean_epoc_stream": mean_epoc_stream,
-        "std_epoc_stream": std_epoc_stream,
-        "sem_epoc_stream": sem_epoc_stream
-    })
-
-    # ---------------------
-    # Plotting (optional)
-    # ---------------------
-    fig_trial = None
-    fig_across = None
-    fig_within = None
-
-    mean_across_animal = None
-    sem_across_animal  = None
-    
-    if paperfigs:
-        # use consistent color maps, line widths, alpha
-        mean_color = np.array([36, 106, 72]) / 255         # across-trial mean
-        sem_alpha = 0.4
-        cue_color = 'blue'
-        approach_color = 'magenta'
-        auc_pre_color = 'blue'
-        auc_post_color = 'magenta'
-        line_width_mean = 2
-        line_width_individual = 1.5
-    else:
-        # legacy or interactive defaults
-        mean_color = 'yellow'
-        sem_alpha = 0.3
-        line_width_mean = 2
-        line_width_individual = 1.5
-
-
-    if per_animal_traces is not None and len(per_animal_traces) > 0:
-        all_means = np.array([trace["mean"] for trace in per_animal_traces])
-        mean_across_animal = np.nanmean(all_means, axis=0)
-        sem_across_animal  = np.nanstd(all_means, axis=0, ddof=1) / np.sqrt(all_means.shape[0])
-
-    if plot:
-        import matplotlib.cm as cm
-
-        # ------------------------------------------------------------
-        # FIGURE 1 — ACROSS-TRIAL
-        # ------------------------------------------------------------
-        fig_trial, ax = plt.subplots(1, 1, figsize=master_figsize if paperfigs else (11,6))
-        ax.axvline(0, color='r', linewidth=1, zorder=0)
-        ax.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
-        
-        if paperfigs:
-            configure_axis(ax)
-
-        ax.plot(epoc_ts, mean_epoc_stream, color=mean_color, linewidth=line_width_mean, label='Mean response', zorder=11)
-        ax.fill_between(epoc_ts,
-                        mean_epoc_stream - sem_epoc_stream,
-                        mean_epoc_stream + sem_epoc_stream,
-                        color=mean_color, alpha=sem_alpha, linewidth=0,
-                        edgecolor='none', label='SEM', zorder=10)
-
-        # Y-limits
-        k = 8
-        y_min = np.nanmin(mean_epoc_stream - k * sem_epoc_stream)
-        y_max = np.nanmax(mean_epoc_stream + k * sem_epoc_stream)
-        ax.set_ylim(y_min, y_max)
-        top_bar = y_max * 0.95
-
-        # Cue and approach bars
-        if not paperfigs:
-            for window, color, label in zip([cue_window, approach_window],
-                                            ['yellow', 'magenta'],
-                                            ['cue', 'approach']):
-                if window is not None:
-                    start, end = window
-                    x = epoc_ts[(epoc_ts >= start) & (epoc_ts <= end)]
-                    if x.size:
-                        ax.fill_between(x, top_bar*0.98, top_bar, color=color, alpha=0.7)
-                        ax.text(np.mean(x), top_bar*1.01, label, color=color,
-                                ha='center', va='bottom', fontsize=8)
-
-        # AUC shading
-        if plot_auc_region:
-            def safe_fill(window, color):
-                start, end = window
-                i0 = np.searchsorted(epoc_ts, start)
-                i1 = np.searchsorted(epoc_ts, end)
-                if i0 >= i1:
-                    return
-                y = mean_epoc_stream[i0:i1]
-                if np.all(np.isnan(y)):
-                    return
-                y = pd.Series(y).interpolate(limit_direction='both').to_numpy()
-                ax.fill_between(epoc_ts[i0:i1], 0, y, color=color, alpha=0.5, linewidth=0, edgecolor='none')
-
-            if auc_pre_window is not None:
-                safe_fill(auc_pre_window, 'green')
-            if auc_post_window is not None:
-                safe_fill(auc_post_window, 'blue')
-
-        ax.set_title('Across-trial mean ± SEM')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Fluorescence (z-score)')
-        ax.set_xlim(master_xlim)
-        ax.set_ylim (master_ylim)
-        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False, markerscale=2)
-
-
-        # ------------------------------------------------------------
-        # FIGURE 2 — ACROSS-ANIMAL
-        # ------------------------------------------------------------
-        fig_across, ax = plt.subplots(1, 1, figsize=master_figsize if paperfigs else (11,6))
-        ax.axvline(0, color='r', linewidth=1, zorder=0)
-        ax.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
-
-        if paperfigs:
-            configure_axis(ax)
-            
-        if mean_across_animal is not None:
-            ax.plot(epoc_ts, mean_across_animal, color=mean_color, linewidth=line_width_mean, label='Mean across subjects')
-            ax.fill_between(epoc_ts,
-                            mean_across_animal - sem_across_animal,
-                            mean_across_animal + sem_across_animal,
-                            color=mean_color, alpha=sem_alpha, linewidth=0,
-                            edgecolor='none', label='SEM')
-        else:
-            ax.plot(epoc_ts, mean_epoc_stream, color='yellow', linewidth=3, label='Mean response')
-            ax.fill_between(epoc_ts,
-                            mean_epoc_stream - sem_epoc_stream,
-                            mean_epoc_stream + sem_epoc_stream,
-                            color='yellow', alpha=0.4, linewidth=0,
-                            edgecolor='none', label='SEM')
-
-            
-        # -----------------------------
-        # Optional: Overlay Excel significance markers
-        # -----------------------------
-        # ==========================================================
-        # OPTIONAL SIGNIFICANCE OVERLAY (Fully Generalized)
-        # ==========================================================
-        if excel_file_path is not None:
-            try:
-                sig_excel = pd.read_excel(excel_file_path, sheet_name=None)
-
-                y_top = master_ylim[1]
-                vertical_spacing = 0.05  # spacing between stacked marker rows
-
-                # --------------------------------------------------
-                # GROUP COMPARISONS (auto-detect sheets with "vs")
-                # --------------------------------------------------
-                if plot_group_comparison:
-
-                    comparison_sheets = [
-                        name for name in sig_excel.keys()
-                        if "vs" in name.lower()
-                    ]
-
-                    n_sheets = len(comparison_sheets)
-                    # Create a gradient from magenta to dark gray
-                    start_color = np.array([1.0, 0.0, 1.0])  # magenta RGB
-                    end_color = np.array([0.3, 0.3, 0.3])    # dark gray RGB
-                    colors = [
-                        start_color + (end_color - start_color) * (i / max(n_sheets - 1, 1))
-                        for i in range(n_sheets)
-                    ]
-                    colors = [tuple(c) for c in colors]  # convert to tuples for matplotlib
-
-                    for i, sheet_name in enumerate(comparison_sheets):
-
-                        sig_vals = sig_excel[sheet_name].iloc[:, 0].to_numpy()
-
-                        if len(sig_vals) > 1:
-
-                            sig_times = np.linspace(
-                                epoc_ts.min(),
-                                epoc_ts.max(),
-                                len(sig_vals)
-                            )
-
-                            interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
-                            mask = interp_vals > 0.5
-
-                            height = y_top * (0.98 - i * vertical_spacing)
-
-                            ax.scatter(
-                                epoc_ts[mask],
-                                height * np.ones(np.sum(mask)),
-                                marker='o',
-                                color=colors[i],
-                                linewidths=0,
-                                edgecolors='none',
-                                s=7 if paperfigs else 100,
-                                label=sheet_name
-                            )
-
-                # --------------------------------------------------
-                # BASELINE SIGNIFICANCE (auto-detect columns)
-                # --------------------------------------------------
-                if plot_baseline_significance and "Significance From Baseline" in sig_excel:
-
-                    sig_base = sig_excel["Significance From Baseline"]
-
-                    # Color cycle for unlimited groups
-                    cmap = plt.get_cmap("tab10")
-
-                    for j, col in enumerate(sig_base.columns):
-
-                        sig_vals = sig_base[col].to_numpy()
-
-                        if len(sig_vals) > 1:
-
-                            sig_times = np.linspace(
-                                epoc_ts.min(),
-                                epoc_ts.max(),
-                                len(sig_vals)
-                            )
-
-                            interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
-                            mask = interp_vals > 0.5
-
-                            # Stack below comparison markers
-                            baseline_offset = len(comparison_sheets) * vertical_spacing
-                            height = y_top * (0.98 - baseline_offset - j * vertical_spacing)
-
-                            ax.scatter(
-                                epoc_ts[mask],
-                                height * np.ones(np.sum(mask)),
-                                marker='o',
-                                color=cmap(j % 10),
-                                linewidths=0,
-                                edgecolors='none',
-                                s=7 if paperfigs else 100,
-                                label=f"{col} baseline"
-                            )
-
-                ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), markerscale=2)
-
-            except Exception as e:
-                print("⚠️ Could not overlay Excel significance:", e)
-                print("epoc_ts length:", len(epoc_ts))
-        
-        if not paperfigs:    
-            # Cue and approach bars
-            for window, color, label in zip([cue_window, approach_window],
-                                            ['yellow', 'magenta'],
-                                            ['cue', 'approach']):
-                if window is not None:
-                    start, end = window
-                    x = epoc_ts[(epoc_ts >= start) & (epoc_ts <= end)]
-                    if x.size:
-                        ax.fill_between(x, top_bar*0.98, top_bar, color=color, alpha=0.7)
-                        ax.text(np.mean(x), top_bar*1.01, label, color=color,
-                                ha='center', va='bottom', fontsize=8)
-
-        # AUC shading
-        # AUC shading
-        if plot_auc_region:
-
-            def safe_fill(window, color):
-                start, end = window
-                i0 = np.searchsorted(epoc_ts, start)
-                i1 = np.searchsorted(epoc_ts, end)
-                if i0 >= i1:
-                    return
-
-                # Use across-animal mean if available
-                if mean_across_animal is not None:
-                    y_source = mean_across_animal
-                else:
-                    y_source = mean_epoc_stream
-
-                y = y_source[i0:i1]
-
-                if np.all(np.isnan(y)):
-                    return
-
-                y = pd.Series(y).interpolate(limit_direction='both').to_numpy()
-                ax.fill_between(epoc_ts[i0:i1], 0, y, color=color, alpha=0.5, linewidth=0,
-                        edgecolor='none')
-
-            if auc_pre_window is not None:
-                safe_fill(auc_pre_window, 'green')
-            if auc_post_window is not None:
-                safe_fill(auc_post_window, 'blue')
-
-
-        ax.set_ylim(y_min, y_max)
-        ax.set_title('Across-animal mean ± SEM')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Fluorescence (z-score)')
-        ax.set_xlim(master_xlim)
-        ax.set_ylim(master_ylim)
-        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False, markerscale=2)
-
-
-        # ------------------------------------------------------------
-        # FIGURE 3 — WITHIN-ANIMAL
-        # ------------------------------------------------------------
-        fig_within = None
-        if per_animal_traces is not None and len(per_animal_traces) > 0:
-            fig_within, ax = plt.subplots(1, 1, figsize=master_figsize if paperfigs else (11,6))
-            ax.axvline(0, color='r', linewidth=1, zorder=0)
-            ax.axhline(0, color=[0.5, 0.5, 0.5], linestyle='--', linewidth=0.8, zorder=0)
-            
-            if paperfigs:
-                configure_axis(ax)
-            
-            # Plot per-animal traces
-       
-            cmap_name = "viridis"   # <- easily change this
-            cmap = cm.get_cmap(cmap_name)
-            colors = cmap(np.linspace(0.1, 0.9, len(per_animal_traces)))
-            
-            for trace, c in zip(per_animal_traces, colors):
-                mean = trace['mean']
-                sem  = trace['sem']
-                rat  = trace['rat']
-                ax.plot(epoc_ts, mean, color=c, linewidth=line_width_individual, alpha=0.9, label=rat)
-                ax.fill_between(epoc_ts, mean - sem, mean + sem, color=c, alpha=sem_alpha, linewidth=0,
-                edgecolor='none',)
-
-                
-            # -----------------------------
-            # Optional: Overlay Excel significance markers
-            # -----------------------------
-            # ==========================================================
-            # OPTIONAL SIGNIFICANCE OVERLAY (Fully Generalized)
-            # ==========================================================
-            if excel_file_path is not None:
-                try:
-                    sig_excel = pd.read_excel(excel_file_path, sheet_name=None)
-
-                    y_top = master_ylim[1]
-                    vertical_spacing = 0.05  # spacing between stacked marker rows
-
-                    # --------------------------------------------------
-                    # GROUP COMPARISONS (auto-detect sheets with "vs")
-                    # --------------------------------------------------
-                    if plot_group_comparison:
-
-                        comparison_sheets = [
-                            name for name in sig_excel.keys()
-                            if "vs" in name.lower()
-                        ]
-
-                        n_sheets = len(comparison_sheets)
-                        # Create a gradient from magenta to dark gray
-                        start_color = np.array([1.0, 0.0, 1.0])  # magenta RGB
-                        end_color = np.array([0.3, 0.3, 0.3])    # dark gray RGB
-                        colors = [
-                            start_color + (end_color - start_color) * (i / max(n_sheets - 1, 1))
-                            for i in range(n_sheets)
-                        ]
-                        colors = [tuple(c) for c in colors]  # convert to tuples for matplotlib
-
-                        for i, sheet_name in enumerate(comparison_sheets):
-
-                            sig_vals = sig_excel[sheet_name].iloc[:, 0].to_numpy()
-
-                            if len(sig_vals) > 1:
-
-                                sig_times = np.linspace(
-                                    epoc_ts.min(),
-                                    epoc_ts.max(),
-                                    len(sig_vals)
-                                )
-
-                                interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
-                                mask = interp_vals > 0.5
-
-                                height = y_top * (0.98 - i * vertical_spacing)
-
-                                ax.scatter(
-                                    epoc_ts[mask],
-                                    height * np.ones(np.sum(mask)),
-                                    marker='o',
-                                    color=colors[i],
-                                    linewidths=0,
-                                    edgecolors='none',
-                                    s=7 if paperfigs else 100,
-                                    label=sheet_name
-                                )
-
-                    # --------------------------------------------------
-                    # BASELINE SIGNIFICANCE (auto-detect columns)
-                    # --------------------------------------------------
-                    if plot_baseline_significance and "Significance From Baseline" in sig_excel:
-
-                        sig_base = sig_excel["Significance From Baseline"]
-
-                        # Color cycle for unlimited groups
-                        cmap = plt.get_cmap("tab10")
-
-                        for j, col in enumerate(sig_base.columns):
-
-                            sig_vals = sig_base[col].to_numpy()
-
-                            if len(sig_vals) > 1:
-
-                                sig_times = np.linspace(
-                                    epoc_ts.min(),
-                                    epoc_ts.max(),
-                                    len(sig_vals)
-                                )
-
-                                interp_vals = np.interp(epoc_ts, sig_times, sig_vals)
-                                mask = interp_vals > 0.5
-
-                                # Stack below comparison markers
-                                baseline_offset = len(comparison_sheets) * vertical_spacing
-                                height = y_top * (0.98 - baseline_offset - j * vertical_spacing)
-
-                                ax.scatter(
-                                    epoc_ts[mask],
-                                    height * np.ones(np.sum(mask)),
-                                    marker='o',
-                                    color=cmap(j % 10),
-                                    linewidths=0,
-                                    edgecolors='none',
-                                    s=7 if paperfigs else 100,
-                                    label=f"{col} baseline"
-                                )
-
-                    ax.legend(loc='upper right', fontsize=10, markerscale=2)
-
-                except Exception as e:
-                    print("⚠️ Could not overlay Excel significance:", e)
-                    print("epoc_ts length:", len(epoc_ts))
-
-            # -----------------------------
-            if not paperfigs:
-                # Add cue/approach bars
-                # -----------------------------
-                top_bar = np.nanmax([trace["mean"] + trace["sem"] for trace in per_animal_traces])
-                for window, color, label in zip([cue_window, approach_window],
-                                                ['yellow', 'magenta'],
-                                                ['cue', 'approach']):
-                    if window is not None:
-                        start, end = window
-                        x = epoc_ts[(epoc_ts >= start) & (epoc_ts <= end)]
-                        if x.size:
-                            ax.fill_between(x, top_bar*0.98, top_bar, color=color, alpha=0.7, linewidth=0, edgecolor='none')
-                            ax.text(np.mean(x), top_bar*1.01, label, color=color,
-                                    ha='center', va='bottom', fontsize=8)
-
-            ax.set_title('Within-animal mean ± SEM')
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Fluorescence (z-score)')
-            ax.set_xlim(master_xlim)
-            ax.set_ylim(master_ylim)
-            ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), frameon=False, markerscale=2)
-
-    return (
-        combined_epocs,
-        combined_epocs_baselined,
-        epoc_stats,
-        mean_epoc_stream,
-        std_epoc_stream,
-        sem_epoc_stream,
-        fig_trial,
-        fig_across,
-        fig_within,
-        fig_onset,
-        fig_trials,
-        (cue_mean, cue_sem),
-        (auc_pre_mean, auc_pre_sem),
-        (auc_post_mean, auc_post_sem),
-        (approach_mean, approach_sem),
-        (onset_mean, onset_sem),
-        (slope_mean, slope_sem),
-        (time_to_peak_mean, time_to_peak_sem),
-        (onset_peak_amp_mean, onset_peak_amp_sem),
-        (overall_peak_amp_mean, overall_peak_amp_sem),
-        (overall_peak_time_mean, overall_peak_time_sem),
-        per_epoc_stats_df
-    )
 
 
 
