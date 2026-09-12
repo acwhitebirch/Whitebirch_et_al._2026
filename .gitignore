@@ -1,1 +1,4 @@
 .ipynb_checkpoints/
+last_paths.json 
+__pycache__/
+*.pyc
