@@ -5514,8 +5514,8 @@ def run_perievent_pipeline(
         fig_trial_all,
         fig_across_all,
         fig_within_all,
-        fig_onset,
-        fig_trials,
+        fig_onset_all,
+        fig_trials_all,
         (cue_mean_all, cue_sem_all),
         (auc_pre_mean_all, auc_pre_sem_all),
         (auc_post_mean_all, auc_post_sem_all),
@@ -5534,7 +5534,7 @@ def run_perievent_pipeline(
         plot=True,
         per_animal_traces=per_animal_traces,
         plot_onset_detection=False,
-        plot_individual_trials = False,
+        plot_individual_trials = True,
         master_xlim = master_xlim,
         master_ylim = master_ylim,
         overall_peak_window = (0,8),
@@ -6602,7 +6602,9 @@ def run_perievent_pipeline(
 
 
 
-# concatenate multiple recording segments for stats and plotting ---------------------------------------------------------------------    
+# concatenate multiple recording segments for stats and plotting ---------------------------------------------------------------------   
+
+# updating documentation 09.12.26
 
 def perievent_analysis(
         *,
@@ -6622,7 +6624,6 @@ def perievent_analysis(
         per_animal_traces=None,
         per_animal_labels=None,
         subset = None,
-        # --- NEW ONSET/SLOPE PARAMETERS ---
         onset_search_window=(0, 3),
         deriv_threshold=0.05,
         deriv_smooth_window=7,
@@ -6656,15 +6657,15 @@ def perievent_analysis(
         mean_epoc_stream,
         std_epoc_stream,
         sem_epoc_stream,
+        fig_trial,
         fig_across,
         fig_within,
+        fig_onset,
         fig_trials,
-        None,
         (cue_mean, cue_sem),
         (auc_pre_mean, auc_pre_sem),
         (auc_post_mean, auc_post_sem),
         (approach_mean, approach_sem),
-        fig_onset,
         (onset_mean, onset_sem),
         (slope_mean, slope_sem),
         (time_to_peak_mean, time_to_peak_sem),
@@ -6685,6 +6686,8 @@ def perievent_analysis(
     from scipy.stats import linregress
     from matplotlib.ticker import MultipleLocator
 
+    
+    # this is used to standardize ticks in publication figures - may need to be adjusted based on specific data 
     def configure_axis(ax):
         ax.yaxis.set_major_locator(MultipleLocator(1))
         ax.minorticks_off()
@@ -6750,26 +6753,34 @@ def perievent_analysis(
         if df.shape[1] == 0:
             continue
 
+        # pathlib .stem extracts the file name, stripping the extension.
+        # pathlib treats file paths as objects with associated methods
         fname = Path(f).stem
-        rat_match = re.search(r'ACW_coh5_IT_[fm]\d+', fname)
+        
+        # for each file in the feather_files list, extract the animal ID 
+        rat_match = re.search(r'ACW_coh\d+_IT_[fm]\d+', fname)  # updated this, previously was just "coh5"
         rat_id = rat_match.group(0) if rat_match else "unknown_rat"
 
         df.columns = [f"{rat_id}_{col}" for col in df.columns]
+        
+        # populate the epoc_dfs list, becomes a list of dataframes from each file
+        # epoc_rats keeps track of the animals being analyzed
         epoc_dfs.append(df)
         epoc_rats.append(rat_id)
 
-        # Track source file for each column
+        # Track source file for each column, i.e. same file name repeated x number of events
         epoc_sources_per_df.append([Path(f).name] * df.shape[1])
         
     if len(epoc_dfs) == 0:
         raise ValueError("No epocs remaining after subsetting/baseline filtering.")
 
+    # aggregate the list of dataframes from feather_files into a new combined dataframe
     combined_epocs = pd.concat(epoc_dfs, axis=1).reset_index(drop=True)
 
-    # Deduplicate columns if needed
+    # Deduplicate columns if needed, can end up with duplicates
     def dedupe_columns(cols):
-        seen = {}
-        out = []
+        seen = {} # empty dictionary
+        out = [] # empty list
         for c in cols:
             if c not in seen:
                 seen[c] = 0
@@ -6791,6 +6802,7 @@ def perievent_analysis(
         filtered_epoc_dfs = []
         filtered_sources = []
 
+        # first, check is enough baseline exists (e.g. event didn't occurr too soon in recording segment)
         for df, src_list in zip(epoc_dfs, epoc_sources_per_df):
 
             baseline_slice = df.iloc[baseline_start_idx:baseline_end_idx]
@@ -6811,7 +6823,7 @@ def perievent_analysis(
         combined_epocs.columns = dedupe_columns(combined_epocs.columns)
 
         baseline_slice = combined_epocs.iloc[baseline_start_idx:baseline_end_idx]
-        baselines = baseline_slice.mean()
+        baselines = baseline_slice.mean()  # mean in the baseline interval, for each column / event
         combined_epocs_baselined = combined_epocs.subtract(baselines, axis=1)
         data_to_use = combined_epocs_baselined
 
@@ -6819,8 +6831,17 @@ def perievent_analysis(
     else:
         combined_epocs_baselined = combined_epocs.copy()
         data_to_use = combined_epocs_baselined
+        # No filtering happened, so just flatten the per-file source lists as-is
+        epoc_sources = [src for src_list in epoc_sources_per_df for src in src_list]
 
 
+    # the below index slicing and time vector construction assume that the steam data begins at ts = trange[0]
+    # in my typical case, -10 seconds from the event. 
+    #    This should be true if the perivent data was preprocessed using my epoc_streams function, 
+    #    which takes trange as an input defined as [x, y] where x is the second preceding the event, and y is the total duration 
+    #    e.g. [-10, 25] in the preprocessing extracts segments beginning 10 seconds before the event and 15 seconds following the event
+    #    the trange defined in the compute_kwargs for the analysis code should match that used in the preprocessing. 
+    
     # After baseline correction
     if trange is not None:
         start_idx = max(int((trange[0] - trange[0]) * new_fs), 0)  # 0 offset
@@ -6833,25 +6854,39 @@ def perievent_analysis(
     epoc_ts = trange[0] + np.arange(len(data_to_use)) / new_fs
 
     #epoc_ts = np.linspace(trange[0], trange[1], data_to_use.shape[0])
-    
-    ###################################
 
-    dt = epoc_ts[1] - epoc_ts[0]
+    '''
+    Key variables at this point:
+    
+    epoc_dfs: list of dataframes, one per input file, headers renamed to include rat IDs
+    
+    epoc_rats, epoc_sources_per_df: lists of rat IDs and source file names
+    
+    combined_epocs and combined_epocs_baselined: key outputs, dataframes containing all events collected from the input list of files
+    
+    data_to_use: key variable used for downstream steps, typically a baseline subtracted dataframe with columns corresponding to each event
+    
+    epoc_ts: the time vector built from trange according to the sampling rate
+    
+    '''
 
     # ============================================================
     # 🔬 ONSET + SLOPE DETECTION
     # ============================================================
     
+    # this onset and slope detection doesn't work well unless there is a pretty clear and robust positive transient
     
     from statsmodels.robust.robust_linear_model import RLM
     from statsmodels.tools import add_constant
     from scipy.signal import savgol_filter
     import numpy as np
-
     
+    dt = epoc_ts[1] - epoc_ts[0]
     
     def detect_onset_and_slope(
-            y, epoc_ts, dt,
+            y,   # numpy array corresponding to one column of the data_to_use dataframe
+            epoc_ts, 
+            dt, 
             onset_search_window,
             deriv_threshold,
             deriv_smooth_window,
@@ -6881,6 +6916,8 @@ def perievent_analysis(
         # -----------------------------
         # Restrict to onset search window
         # -----------------------------
+        # use a Numpy booleean array 
+        
         mask = (epoc_ts >= onset_search_window[0]) & (epoc_ts <= onset_search_window[1])
         if mask.sum() < 3:
             return np.nan, np.nan, np.nan, np.nan
@@ -6891,15 +6928,12 @@ def perievent_analysis(
         # -----------------------------
         # Remove NaNs early
         # -----------------------------
-        if np.all(np.isnan(y_win)):
-            return np.nan, np.nan, np.nan, np.nan
-
         if np.any(np.isnan(y_win)):
             return np.nan, np.nan, np.nan, np.nan
 
-
         # -----------------------------
         # Smooth signal for peak detection
+        # this lessens influence of noise in the signal
         # -----------------------------
         from scipy.ndimage import gaussian_filter1d
         y_smooth = gaussian_filter1d(y_win, sigma=2)
@@ -6907,10 +6941,9 @@ def perievent_analysis(
         # -----------------------------
         # Peak detection (on smoothed signal)
         # -----------------------------
-        peak_idx = np.nanargmax(y_smooth)
+        peak_idx = np.nanargmax(y_smooth) # returns index of the max value
         onset_peak_val = y_smooth[peak_idx]
         onset_peak_time = ts_win[peak_idx]
-        
         
         if onset_peak_val < min_peak_amplitude:
             return np.nan, np.nan, np.nan, np.nan
@@ -6932,6 +6965,7 @@ def perievent_analysis(
 
         # -----------------------------
         # Compute derivative safely
+        # the idea is to compute a smoothed derivative, i.e. rate of change at each time point
         # -----------------------------
         try:
             dydt = savgol_filter(
@@ -6951,11 +6985,13 @@ def perievent_analysis(
         # Dynamic derivative threshold
         # -----------------------------
         max_dydt = np.nanmax(dydt)
-        dynamic_threshold = max(deriv_threshold, 0.1 * max_dydt)
+        dynamic_threshold = max(deriv_threshold, 0.1 * max_dydt) 
         above = dydt > dynamic_threshold
 
         # -----------------------------
         # Derivative-based onset
+        # moving window looks for consecutive points that exceed the derivative threshold
+        # consecutive points so noisy spikes don't count
         # -----------------------------
         onset_idx_deriv = None
         for i in range(len(above) - consecutive_points + 1):
@@ -6972,6 +7008,7 @@ def perievent_analysis(
 
         # -----------------------------
         # Combine logic
+        # whichever happens first, derivative or amplitude-based onset, is used for the onset time
         # -----------------------------
         if onset_idx_deriv is None and onset_idx_amp is None:
             return np.nan, np.nan, np.nan, np.nan
@@ -6999,7 +7036,6 @@ def perievent_analysis(
         threshold_val = peak_fraction * onset_peak_val
         above_thresh = np.where(y_win >= threshold_val)[0]
         valid_end = above_thresh[above_thresh > onset_idx]
-
         end_idx = valid_end[0] if len(valid_end) > 0 else peak_idx
 
         if end_idx <= onset_idx:
@@ -7013,25 +7049,25 @@ def perievent_analysis(
 
         # -----------------------------
         # Robust linear fit
+        # this comes from statsmodels
         # -----------------------------
         try:
             X = add_constant(x_fit)
-            rlm_model = RLM(y_fit, X)
-            slope = rlm_model.fit().params[1]
+            rlm_model = RLM(y_fit, X)  # constructs a robust linear model, should downweight noisy outliers in the data
+            slope = rlm_model.fit().params[1]  # performs the fit, returns results, from which the slope is extracted
         except Exception:
             slope = np.nan
 
         return onset_time, slope, time_to_peak, onset_peak_val
 
+    # dictionaries, eventually populated with one entry per event
     onset_dict = {}
     slope_dict = {}
     time_to_peak_dict = {}
     onset_peak_amp_dict = {}
     
-    dt = epoc_ts[1] - epoc_ts[0]
-
     for col in data_to_use.columns:
-        y = data_to_use[col].values
+        y = data_to_use[col].values  # for each event/column, extract .values (pandas series --> numpy array)
         onset, slope, ttp, onset_peak_amp = detect_onset_and_slope(
             y, epoc_ts, dt,
             onset_search_window=onset_search_window,
@@ -7043,6 +7079,9 @@ def perievent_analysis(
             min_peak_amplitude=min_peak_amplitude,
             amp_onset_fraction=amp_onset_fraction
         )
+        
+        # dictionaries consist of {column name: value} pairings
+        # these four dictionaries will end up populating the per_epoc_stats_df below
         onset_dict[col] = onset
         slope_dict[col] = slope
         time_to_peak_dict[col] = ttp
@@ -7080,7 +7119,7 @@ def perievent_analysis(
     
     
     # ---------------------
-    # Per-epoc stats (fixed for proper alignment)
+    # Per-epoc stats
     # ---------------------
     per_epoc_stats_df = pd.DataFrame(index=data_to_use.columns)
     per_epoc_stats_df.index.name = "epoc_id"
@@ -7090,20 +7129,16 @@ def perievent_analysis(
     per_epoc_stats_df["rising_slope"] = [slope_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
     per_epoc_stats_df["time_to_peak_sec"] = [time_to_peak_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
     per_epoc_stats_df["onset_peak_amplitude"] = [onset_peak_amp_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
-    per_epoc_stats_df["overall_peak_amp"] = [
-    overall_peak_amp_dict.get(epoc, np.nan)
-        for epoc in per_epoc_stats_df.index
-    ]
-
-    per_epoc_stats_df["overall_peak_amp_timestamp"] = [
-        overall_peak_time_dict.get(epoc, np.nan)
-        for epoc in per_epoc_stats_df.index
-    ]
+    per_epoc_stats_df["overall_peak_amp"] = [overall_peak_amp_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
+    per_epoc_stats_df["overall_peak_amp_timestamp"] = [overall_peak_time_dict.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
 
     # ---------------------
     
-    # Per-rat mean + SEM
+    # compute mean + SEM over current set of events
+    # in tier 1 of the run_perievent_analysis function, these are effectively per-rat values
+    # in tier 2, would be across all trials/rats
     # ---------------------
+    
     latency_vals = per_epoc_stats_df["response_latency_sec"].values
     slope_vals = per_epoc_stats_df["rising_slope"].values
     time_to_peak_vals = per_epoc_stats_df["time_to_peak_sec"].values
@@ -7258,15 +7293,14 @@ def perievent_analysis(
             ax.set_ylabel("Fluorescence (z-score)")
             ax.set_xlim(-0.5,3)
 
-    ###################################
-    
-    
+            
     # ---------------------
-    # Mean / std / SEM
+    # Mean / std / SEM of the perievent data
     # ---------------------
     n_trials = data_to_use.shape[1]
     
     mean_epoc_stream = np.nanmean(data_to_use, axis=1)
+
     if n_trials > 1:
         std_epoc_stream = np.nanstd(data_to_use, axis=1, ddof=1)
         sem_epoc_stream = stats.sem(data_to_use, axis=1, nan_policy='omit')
@@ -7304,10 +7338,10 @@ def perievent_analysis(
         for col in data_to_use.columns:
             y = data_to_use[col].iloc[start_idx:end_idx].values
             x = epoc_ts[start_idx:end_idx]
-            finite_mask = np.isfinite(y)
+            finite_mask = np.isfinite(y)  # double check, why the np.isfinite step? 
             if finite_mask.sum() < 2:
                 continue
-            auc = np.trapz(y[finite_mask], x[finite_mask])
+            auc = np.trapz(y[finite_mask], x[finite_mask])  # this will eventually need to be updated to np.trapezoid I think
             if np.isfinite(auc):
                 auc_vals.append(auc)
         if len(auc_vals) == 0:
@@ -7350,6 +7384,9 @@ def perievent_analysis(
     auc_pre_vals = per_epoc_auc(auc_pre_window)
     auc_post_vals = per_epoc_auc(auc_post_window)
 
+    # further build the per_epoc dataframe created above containing onset, peak, and slope measures
+    # now add the mean and AUC values for identified windows, for each event
+    
     per_epoc_stats_df["cue_mean"] = [cue_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
     per_epoc_stats_df["approach_mean"] = [approach_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
     per_epoc_stats_df["auc_pre"] = [auc_pre_vals.get(epoc, np.nan) for epoc in per_epoc_stats_df.index]
@@ -7358,11 +7395,11 @@ def perievent_analysis(
     # Add source file
     per_epoc_stats_df["source_file"] = epoc_sources
 
-    # Reset index if you want epoc_id as a column
+    # Reset index for epoc_id as a column
     per_epoc_stats_df = per_epoc_stats_df.reset_index()
     
     # ---------------------
-    # Stats DataFrame (time-resolved)
+    # Stats DataFrame (time-resolved), aka the perievent mean and SEM trace
     # ---------------------
     epoc_stats = pd.DataFrame({
         "mean_epoc_stream": mean_epoc_stream,
@@ -7370,6 +7407,9 @@ def perievent_analysis(
         "sem_epoc_stream": sem_epoc_stream
     })
 
+    
+    
+    
     # ---------------------
     # Plotting (optional)
     # ---------------------
@@ -7616,7 +7656,6 @@ def perievent_analysis(
                         ax.text(np.mean(x), top_bar*1.01, label, color=color,
                                 ha='center', va='bottom', fontsize=8)
 
-        # AUC shading
         # AUC shading
         if plot_auc_region:
 
